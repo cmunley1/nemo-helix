@@ -17,17 +17,21 @@ is written via :func:`~nemo_evals.jobs.result_persistence.persist_agent_eval_res
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import shutil
+import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, ClassVar, Literal
 
 import nemo_evals.agent_seeds  # noqa: F401 - registers the platform 'fileset' workspace-seed handler
 from nemo_evals.config import get_config
 from nemo_evals.harbor.resolution import map_with_limited_concurrency
+from nemo_evals.harbor.trial_credentials import TrialCredentialIssuer, issuing, with_trial_credentials
 from nemo_evals.jobs.agent_compiler import (
     _compile_agent_eval_cpu_job,
     _secret_refs,
@@ -119,6 +123,7 @@ from nemo_helix_plugin.jobs.execution_profiles import (
     VolcanoJobExecutionProfile,
 )
 from nemo_helix_plugin.jobs.spec import BaseExecutionProfile
+from nemo_helix_plugin.models.refs import parse_workspace_name_ref
 from nhx_evals_sdk.agent_eval.evaluator import AgentEvaluator
 from nhx_evals_sdk.agent_eval.results import AgentEvalResult
 from nhx_evals_sdk.agent_eval.runtimes.fabric.runtime import FabricAgentRuntime
@@ -551,6 +556,8 @@ class _AgentEvalJobBase(NemoJob):
                 harbor_config = point_agent_at_gateway_model(
                     harbor_config.model_copy(update={"agent_kwargs": agent_kwargs}), target, origin
                 )
+                if target.gateway_model is not None and target.gateway_agent_env is not None:
+                    harbor_config = with_trial_credentials(harbor_config, target.gateway_agent_env.api_key_env)
             harbor_runtime = HarborAgentTaskRunner(
                 config=harbor_config,
                 secret_resolver=JobEnvSecretSource(workspace=ctx.workspace),
@@ -610,6 +617,8 @@ class _AgentEvalJobBase(NemoJob):
         bundle_dir = ctx.storage.persistent / AGENT_BUNDLE_DIR
         if bundle_dir.exists():
             shutil.rmtree(bundle_dir)
+        run_id = self._run_id() or f"agent-eval-{datetime.now(UTC):%Y%m%d%H%M%S}-{uuid.uuid4().hex[:8]}"
+        issuer = _trial_credential_issuer(spec, ctx, async_client, run_id)
         run_config = AgentEvalRunConfig(
             params=params,
             prompt_template=prompt_template,
@@ -617,7 +626,7 @@ class _AgentEvalJobBase(NemoJob):
             labels=spec.labels,
             fail_fast=spec.fail_fast,
             work_dir=bundle_dir,
-            run_id=self._run_id(),
+            run_id=run_id,
         )
         evaluator = self._build_evaluator(platform_client, spec.target)
         include_trial_measurements = not isinstance(spec.target, ModelTarget | AgentTarget)
@@ -630,9 +639,10 @@ class _AgentEvalJobBase(NemoJob):
                 request_logs,
                 include_trial_measurements=include_trial_measurements,
             ) as usage_capture:
-                result = usage_capture.record(
-                    evaluator.run_sync(tasks=tasks, trials=spec.trials, target=target, config=run_config)
-                )
+                with issuing(issuer) if issuer is not None else contextlib.nullcontext():
+                    result = usage_capture.record(
+                        evaluator.run_sync(tasks=tasks, trials=spec.trials, target=target, config=run_config)
+                    )
 
         files = self._write_result_files(result, ctx.storage.persistent)
         artifact = ctx.results.save(DEFAULT_RESULT_NAME, files.bundle_dir)
@@ -677,7 +687,6 @@ class _AgentEvalJobBase(NemoJob):
                 workspace=ctx.workspace,
                 intake=intake,
                 record_durations=self.record_publication_durations,
-                trial_root_span=self._trial_root_span(),
             )
             output["publication"] = publication_outcome.model_dump(exclude_none=True)
             # The job output isn't persisted; status details are, so `runs status` can say what was published.
@@ -703,16 +712,30 @@ class _AgentEvalJobBase(NemoJob):
         """Hook: the SDK run id, which keys published sessions (``run_id:trial_id``). None generates one."""
         return None
 
-    def _trial_root_span(self) -> Callable[[str], str] | None:
-        """Hook: each trial's root span id when trials' spans reach Intake live. None publishes trajectories."""
-        return None
-
     def _prepared_tasks(self, tasks: list[AgentEvalTask]) -> None:
         """Hook: inspect or adjust materialized tasks before they run. Does nothing by default."""
 
     def _configure_harbor_runtime(self, config: HarborRuntimeConfig, ctx: JobContext) -> HarborRuntimeConfig:
         """Hook: adjust a Harbor runner's config before it runs. Returns it unchanged by default."""
         return config
+
+
+def _trial_credential_issuer(
+    spec: AgentEvalSpec, ctx: JobContext, async_client: AsyncNemoClient | None, run_id: str
+) -> TrialCredentialIssuer | None:
+    """The issuer of each trial's gateway credential, for a Harbor agent that calls a gateway model."""
+    target = spec.target
+    if async_client is None or not isinstance(target, HarborRunnerTarget) or target.gateway_model is None:
+        return None
+    workspace, _ = parse_workspace_name_ref(target.gateway_model.root, label="Gateway model")
+    publication = spec.publication.intake if spec.publication is not None else None
+    return TrialCredentialIssuer(
+        async_client,
+        run_id=run_id,
+        credential_workspace=workspace,
+        intake_workspace=ctx.workspace,
+        evaluation_name=publication.evaluation_id if publication is not None else None,
+    )
 
 
 class AgentEvalJob(_AgentEvalJobBase):

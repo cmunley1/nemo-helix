@@ -112,6 +112,10 @@ class _EvaluatorMethods:
     list_agent_eval_results = method(endpoints.list_agent_eval_results)
     delete_agent_eval_result = method(endpoints.delete_agent_eval_result)
 
+    create_trial_credential = method(endpoints.create_trial_credential)
+    end_trial_credential = method(endpoints.end_trial_credential)
+    get_trial_credential = method(endpoints.get_trial_credential)
+
 
 class EvaluatorClient(_EvaluatorMethods, NemoClient):
     """Sync client for the Evals service API."""

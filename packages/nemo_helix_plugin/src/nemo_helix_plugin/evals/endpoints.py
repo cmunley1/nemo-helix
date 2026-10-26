@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from abc import abstractmethod
 
-from nemo_helix_plugin.client.endpoint import delete, get, post, put
+from nemo_helix_plugin.client.endpoint import delete, get, patch, post, put
 from nemo_helix_plugin.client.types import BinaryContent, CursorPagination, Paginated
 from nemo_helix_plugin.evals.types import (
     AgentEvalJob,
@@ -24,6 +24,8 @@ from nemo_helix_plugin.evals.types import (
     CreateTaskImageBuildRequest,
     CreateTaskRequest,
     CreateTasksetRequest,
+    CreateTrialCredentialRequest,
+    EndTrialCredentialRequest,
     EvalResult,
     EvaluateJob,
     EvaluatorHealth,
@@ -50,6 +52,7 @@ from nemo_helix_plugin.evals.types import (
     Task,
     TaskImageBuild,
     Taskset,
+    TrialCredential,
 )
 from nemo_helix_plugin.jobs.schemas import HelixJobLog, HelixJobResultResponse, HelixJobStatusResponse
 from nemo_helix_plugin.jobs.types import (
@@ -66,6 +69,7 @@ _AGENT_EVAL_RESULTS = f"{_EVAL_BASE}/agent-eval-results"
 _METRICS = f"{_EVAL_BASE}/metrics"
 _TASKS = f"{_EVAL_BASE}/tasks"
 _TASKSETS = f"{_EVAL_BASE}/tasksets"
+_TRIAL_CREDENTIALS = f"{_EVAL_BASE}/trial-credentials"
 
 
 # ---------------------------------------------------------------------------
@@ -496,3 +500,20 @@ def list_agent_eval_results(
 @delete(f"{_AGENT_EVAL_RESULTS}/{{name}}")
 @abstractmethod
 def delete_agent_eval_result(*, workspace: str | None = None, name: str) -> None: ...
+
+
+@post(_TRIAL_CREDENTIALS)
+@abstractmethod
+def create_trial_credential(*, workspace: str | None = None, body: CreateTrialCredentialRequest) -> TrialCredential: ...
+
+
+@patch(f"{_TRIAL_CREDENTIALS}/{{name}}")
+@abstractmethod
+def end_trial_credential(
+    *, workspace: str | None = None, name: str, body: EndTrialCredentialRequest
+) -> TrialCredential: ...
+
+
+@get(f"{_TRIAL_CREDENTIALS}/{{name}}")
+@abstractmethod
+def get_trial_credential(*, workspace: str | None = None, name: str) -> TrialCredential: ...

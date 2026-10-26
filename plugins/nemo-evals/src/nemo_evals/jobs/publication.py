@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import logging
 import time
-from collections.abc import Callable
 from datetime import UTC, datetime
 
 from nemo_evals.intake.publish import PublishError, PublishReport, publish_to_intake
@@ -155,7 +154,6 @@ async def _publish(
     agent_name: str,
     model_name: str | None,
     record_durations: bool = True,
-    trial_root_span: Callable[[str], str] | None = None,
 ) -> PublishReport:
     """Check the Evaluation exists, publish under it, then record how long both took (``record_durations``)."""
     # Measured before the publish so the two durations stay disjoint — for a result that carries only
@@ -175,7 +173,6 @@ async def _publish(
         agent_name=agent_name,
         agent_version=spec.agent_version,
         model_name=model_name,
-        trial_root_span=trial_root_span,
     )
     publish_duration_sec = time.monotonic() - publish_started
     if not record_durations:
@@ -209,7 +206,6 @@ def publish_agent_eval_result(
     workspace: str,
     intake: AsyncIntakeClient | None,
     record_durations: bool = True,
-    trial_root_span: Callable[[str], str] | None = None,
 ) -> PublicationOutcome:
     """Publish a finished run to Intake and describe what happened.
 
@@ -255,7 +251,6 @@ def publish_agent_eval_result(
                 agent_name=agent_name,
                 model_name=model_name,
                 record_durations=record_durations,
-                trial_root_span=trial_root_span,
             ),
         )
     except PublishError as error:

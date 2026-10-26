@@ -14,6 +14,7 @@ import pytest
 from harbor.agents.model_connection import ModelConnectionSpec, ProviderAccess
 from nemo_agents_plugin.runner.deployments_backend import UnreachableGatewayURLError
 from nemo_evals.api.fields import AgentRef
+from nemo_evals.harbor.trial_credentials import CREDENTIAL_ENV_KWARG, INNER_AGENT_KWARG, TRIAL_CREDENTIAL_AGENT
 from nemo_evals.jobs import agent_compiler, gateway_agents, gateway_models
 from nemo_evals.jobs.agent_evaluate import AgentEvalJob
 from nemo_evals.jobs.agent_spec import (
@@ -309,6 +310,20 @@ def test_the_job_points_the_agent_at_the_route_for_its_environment(
 
     assert config.agent_model_name == "cb-gpt"
     assert config.env_vars["OPENAI_BASE_URL"] == f"{origin}{ROUTE}/v1"
+
+
+@pytest.mark.parametrize("sandboxed", [False, True], ids=["docker", "sandbox"])
+def test_the_job_gives_each_trial_its_own_gateway_credential(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sandboxed: bool
+) -> None:
+    """The agent is wrapped so each trial's calls carry a credential the gateway can attribute to it."""
+    monkeypatch.setenv("NHX_INTERNAL_BASE_URL", "http://nemo-api.ns.svc:8080")
+
+    config = _job_config(tmp_path, _codex(), sandboxed=sandboxed)
+
+    assert config.agent_import_path == TRIAL_CREDENTIAL_AGENT
+    assert config.agent_kwargs[INNER_AGENT_KWARG] == "codex"
+    assert config.agent_kwargs[CREDENTIAL_ENV_KWARG] == "OPENAI_API_KEY"
 
 
 _NO_NETWORK = {"environment": {"allow_internet": False}}

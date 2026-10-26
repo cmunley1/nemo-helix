@@ -34,6 +34,8 @@ from nemo_evals.harbor.setup_cleanup import KILL_CONNECTION_HOLDERS_SCRIPT, LIST
 SETUP_EGRESS_AGENT = "nemo_evals.harbor.agent_setup_egress:AgentSetupEgress"
 INNER_AGENT_KWARG = "agent_setup_egress_inner"
 SETUP_HOSTS_KWARG = "agent_setup_egress_hosts"
+UNWRAPPED_AGENTS = frozenset({"oracle", "nop"})
+"""Agents that install nothing, and that Harbor constructs or scores differently by name, so they stay unwrapped."""
 
 
 @cache
@@ -213,6 +215,20 @@ def setup_timeout_multiplier(inner: str, multiplier: float) -> float:
     return multiplier * inner_timeout / default
 
 
+def inner_agent_class(inner: str, kwargs: dict[str, Any]) -> type[BaseAgent]:
+    """The class of the real agent ``inner`` (a built-in name or an import path), completing ``kwargs`` for it."""
+    if is_acp_registry_shorthand(inner):
+        kwargs["registry_spec"] = registry_spec_from_agent_name(inner)
+    return _inner_agent_class(inner)
+
+
+def setup_egress_agent_class(kwargs: dict[str, Any]) -> type[BaseAgent]:
+    """The agent class :class:`AgentSetupEgress` builds, taking its own kwargs out of ``kwargs``."""
+    inner = kwargs.pop(INNER_AGENT_KWARG)
+    hosts = tuple(kwargs.pop(SETUP_HOSTS_KWARG, ()))
+    return _with_setup_egress(inner_agent_class(inner, kwargs), hosts)
+
+
 class AgentSetupEgress:
     """Stands in for the real agent class in Harbor's ``AgentConfig.import_path``; never instantiated itself."""
 
@@ -220,11 +236,7 @@ class AgentSetupEgress:
     """Harbor's own default; :func:`setup_timeout_multiplier` scales it to the inner agent's."""
 
     def __new__(cls, *args: Any, **kwargs: Any) -> BaseAgent:
-        inner = kwargs.pop(INNER_AGENT_KWARG)
-        hosts = tuple(kwargs.pop(SETUP_HOSTS_KWARG, ()))
-        if is_acp_registry_shorthand(inner):
-            kwargs["registry_spec"] = registry_spec_from_agent_name(inner)
-        return _with_setup_egress(_inner_agent_class(inner), hosts)(*args, **kwargs)
+        return setup_egress_agent_class(kwargs)(*args, **kwargs)
 
     @classmethod
     def preflight(cls, kwargs: dict[str, Any] | None = None, env: Mapping[str, str] | None = None) -> None:

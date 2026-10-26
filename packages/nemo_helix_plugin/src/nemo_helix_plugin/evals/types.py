@@ -14,7 +14,7 @@ from typing import Annotated, Any, Literal, NotRequired, Self, TypeAlias, TypedD
 from nemo_helix_plugin.jobs.schemas import HelixJobStatus
 from nemo_helix_plugin.jobs.types import validate_output_location
 from nemo_helix_plugin.schema import Page
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, RootModel, field_validator, model_validator
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, JsonValue, RootModel, field_validator, model_validator
 
 FlatQueryParams: TypeAlias = dict[str, str | int | bool | None]
 
@@ -329,6 +329,51 @@ class CreateTaskImageBuildRequest(BaseModel):
     allowed_registries: list[str] = Field(default_factory=list)
     platform: str | None = None
     rebuild: bool = False
+
+
+_SHA256_HEX = r"^[0-9a-f]{64}$"
+_TRACE_ID_HEX = r"^[0-9a-f]{32}$"
+_SPAN_ID_HEX = r"^[0-9a-f]{16}$"
+
+
+class _TrialCredentialFields(BaseModel):
+    session_id: str = Field(min_length=1, max_length=1024, description="The trial's Intake session.")
+    trace_id: str = Field(pattern=_TRACE_ID_HEX, description="The trial's trace id: 32 lowercase hex characters.")
+    root_span_id: str = Field(
+        pattern=_SPAN_ID_HEX, description="The trial's root span id: 16 lowercase hex characters."
+    )
+    intake_workspace: str = Field(min_length=1, description="The workspace the trial's spans are recorded in.")
+    started_at: AwareDatetime = Field(description="When the trial was issued the credential.")
+    evaluation_name: str | None = Field(default=None, description="The Intake evaluation the trial belongs to.")
+    test_case_name: str | None = Field(default=None, description="The Intake test case the trial runs.")
+
+
+class CreateTrialCredentialRequest(_TrialCredentialFields):
+    """Bind a credential, by its SHA-256, to the trial it was issued to."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(pattern=_SHA256_HEX, description="SHA-256 of the credential, as lowercase hex.")
+
+
+class EndTrialCredentialRequest(BaseModel):
+    """Stop attributing calls made with the credential after ``ended_at``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    ended_at: AwareDatetime
+
+
+class TrialCredential(_TrialCredentialFields):
+    """The trial a credential was issued to; the Inference Gateway attributes calls made with it to that trial."""
+
+    name: str = Field(description="SHA-256 of the credential, as lowercase hex.")
+    workspace: str
+    ended_at: AwareDatetime | None = Field(default=None, description="When the trial stopped using the credential.")
+
+    def covers(self, at: datetime) -> bool:
+        """Whether a call made at ``at`` belongs to the trial."""
+        return self.started_at <= at and (self.ended_at is None or at <= self.ended_at)
 
 
 # ---------------------------------------------------------------------------
