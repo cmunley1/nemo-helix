@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import hashlib
 import json
@@ -185,6 +186,40 @@ async def test_a_minted_key_that_cannot_be_recorded_is_revoked(platform: Platfor
     platform.answers[("DELETE", f"{ACCESS_KEYS}/{jti}")] = httpx.Response(200, json={"jti": jti, "revoked": True})
 
     assert await _issuer().issue(_trial_dir(tmp_path), agent_key="users-own-key") is None
+    assert len(platform.bodies("DELETE", f"{ACCESS_KEYS}/{jti}")) == 1
+
+
+async def test_a_minted_key_is_revoked_when_issuing_is_cancelled(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Harbor's setup timeout cancels a trial; a key minted but not yet recorded must not outlive it."""
+    jti = "ak_" + "4" * 32
+    platform = Platform(
+        {
+            ("POST", ACCESS_KEYS): _minted(jti=jti),
+            ("DELETE", f"{ACCESS_KEYS}/{jti}"): httpx.Response(200, json={"jti": jti, "revoked": True}),
+        }
+    )
+    recording = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == CREDENTIALS:
+            recording.set()
+            await asyncio.Event().wait()
+        return platform(request)
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        trial_credentials.httpx,
+        "AsyncClient",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
+    )
+    issuing = asyncio.create_task(_issuer().issue(_trial_dir(tmp_path), agent_key="users-own-key"))
+    await recording.wait()
+
+    issuing.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await issuing
     assert len(platform.bodies("DELETE", f"{ACCESS_KEYS}/{jti}")) == 1
 
 

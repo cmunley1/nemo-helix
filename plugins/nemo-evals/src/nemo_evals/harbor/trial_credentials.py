@@ -135,10 +135,12 @@ class TrialCredentialIssuer:
                 )
                 evals = AsyncEvaluatorClient.from_client(client)
                 (await evals.create_trial_credential(workspace=self._credential_workspace, body=body)).data()
-        except Exception:
-            logger.warning("Could not issue trial %s its own gateway credential", identity.session_id, exc_info=True)
+        except BaseException as e:
             if issued is not None and issued.access_key_jti is not None:
-                await self._revoke(issued.access_key_jti)
+                await asyncio.shield(self._revoke(issued.access_key_jti))
+            if not isinstance(e, Exception):
+                raise
+            logger.warning("Could not issue trial %s its own gateway credential", identity.session_id, exc_info=True)
             return None
         return issued
 

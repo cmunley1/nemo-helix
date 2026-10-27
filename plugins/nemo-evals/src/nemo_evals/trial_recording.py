@@ -261,6 +261,7 @@ class CallRecorder:
         self._trials = trials
         self._sink = sink
         self._queue: asyncio.Queue[FinishedCall] = asyncio.Queue(maxsize=max_queued_calls)
+        self._collecting: list[FinishedCall] = []
         self._max_batch_size = max_batch_size
         self._flush_interval_sec = flush_interval_sec
         self._task: asyncio.Task[None] | None = None
@@ -299,7 +300,10 @@ class CallRecorder:
             logger.warning("Dropped %d queued trial calls at shutdown", self._queue.qsize())
 
     async def flush(self) -> None:
-        """Send everything queued now."""
+        """Send everything queued now, starting with any batch the sender was still collecting."""
+        if self._collecting:
+            batch, self._collecting = self._collecting, []
+            await self._send(batch)
         while not self._queue.empty():
             await self._send(self._take_batch())
 
@@ -313,12 +317,13 @@ class CallRecorder:
     async def _send_next_batch(self) -> None:
         first = await self._queue.get()
         deadline = time.monotonic() + self._flush_interval_sec
-        batch = [first]
-        while len(batch) < self._max_batch_size and (remaining := deadline - time.monotonic()) > 0:
+        self._collecting = [first]
+        while len(self._collecting) < self._max_batch_size and (remaining := deadline - time.monotonic()) > 0:
             try:
-                batch.append(await asyncio.wait_for(self._queue.get(), timeout=remaining))
+                self._collecting.append(await asyncio.wait_for(self._queue.get(), timeout=remaining))
             except TimeoutError:
                 break
+        batch, self._collecting = self._collecting, []
         await self._send(batch)
 
     def _take_batch(self) -> list[FinishedCall]:

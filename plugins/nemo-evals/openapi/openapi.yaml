@@ -9823,7 +9823,8 @@ components:
         name:
           type: string
           title: Name
-          description: SHA-256 of the credential, as lowercase hex.
+          description: '`cred-` and the first 58 hex digits of the credential''s SHA-256,
+            which fits an entity name.'
         workspace:
           type: string
           title: Workspace

@@ -370,7 +370,9 @@ class EndTrialCredentialRequest(BaseModel):
 class TrialCredential(_TrialCredentialFields):
     """The trial a credential was issued to; the Inference Gateway attributes calls made with it to that trial."""
 
-    name: str = Field(description="SHA-256 of the credential, as lowercase hex.")
+    name: str = Field(
+        description="`cred-` and the first 58 hex digits of the credential's SHA-256, which fits an entity name."
+    )
     workspace: str
     ended_at: AwareDatetime | None = Field(default=None, description="When the trial stopped using the credential.")
 

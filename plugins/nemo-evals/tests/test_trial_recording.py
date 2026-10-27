@@ -460,6 +460,21 @@ async def test_queued_calls_are_sent_in_one_batch_per_intake_workspace() -> None
     assert sent == [("evals", ["1", "3"]), ("other", ["2"])]
 
 
+async def test_stopping_sends_the_calls_the_sender_was_still_collecting() -> None:
+    """The sender holds a batch for up to the flush interval; shutting the gateway down mustn't lose it."""
+    sink = Sink()
+    recorder = CallRecorder(TrialCache(Trials(TRIAL)), sink, flush_interval_sec=60)
+    recorder.start()
+    recorder.record(_finished(name="1"))
+    recorder.record(_finished(name="2"))
+    while recorder._queue.qsize():
+        await asyncio.sleep(0.01)
+
+    await recorder.stop()
+
+    assert sorted(span.name for _, span in _spans(sink.sent)) == ["1", "2"]
+
+
 async def test_a_batch_is_split_to_fit_intakes_body_limit(monkeypatch: pytest.MonkeyPatch) -> None:
     from nemo_evals import trial_recording
 

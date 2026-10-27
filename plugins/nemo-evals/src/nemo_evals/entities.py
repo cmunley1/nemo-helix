@@ -399,7 +399,7 @@ class TasksetRevisionEntity(_RevisionCommon, EntityBase):
 
 
 class TrialCredentialEntity(EntityBase):
-    """The trial a credential was issued to, named by the credential's SHA-256."""
+    """The trial a credential was issued to, named ``cred-`` and the first 58 hex digits of the credential's SHA-256."""
 
     __entity_type__: ClassVar[str] = "trial_credential"
 
