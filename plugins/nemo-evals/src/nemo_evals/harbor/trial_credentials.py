@@ -1,26 +1,26 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Give each Harbor trial its own credential for the Inference Gateway, so the gateway can attribute its calls.
+"""Give each Harbor trial its own trial token for the Inference Gateway, so the gateway can attribute its calls.
 
 Harbor builds the agent from :data:`TRIAL_CREDENTIAL_AGENT` with the real agent in the ``trial_attribution_inner``
 kwarg and the variable that holds the agent's gateway key in ``trial_attribution_env``. What it gets back is an
 instance of a subclass of the real agent that, before setup, asks the job's :class:`TrialCredentialIssuer` for a
-credential and puts it in that variable, and ends the credential when the agent finishes.
+trial token (:mod:`nemo_evals.trial_tokens`) and puts it in that variable, and ends the token when the agent
+finishes.
 
-With platform auth off, the gateway ignores credentials, so the agent's placeholder key is replaced with a random
-token. With auth on, the agent holds a key the user supplied; it is replaced with a Scoped Access Key minted for
-the trial on the user's behalf, scoped to inference, and revoked when the trial ends. If that key can't be minted,
-the agent keeps the user's key and its calls are not attributed.
+With platform auth off, the agent holds a placeholder key, which is replaced with an unsigned trial token. With
+auth on, the agent holds a key the user supplied; it is replaced with a Scoped Access Key minted for the trial on
+the user's behalf, scoped to inference, and revoked when the trial ends. If that key can't be minted, the agent
+keeps the user's key and its calls are not attributed.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
-import hashlib
 import logging
-import secrets
+import threading
 from collections.abc import AsyncGenerator, Generator, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -44,13 +44,8 @@ from nemo_evals.harbor.agent_setup_egress import (
 )
 from nemo_evals.intake.mapping import session_id_for
 from nemo_evals.jobs.gateway_agents import GATEWAY_PLACEHOLDER_KEY
-from nemo_evals.trial_credential_records import (
-    AsyncTrialCredentialsClient,
-    CreateTrialCredentialRequest,
-    EndTrialCredentialRequest,
-)
-from nemo_evals.trial_recording import TRIAL_ACCESS_KEY_NAME_PREFIX, TRIAL_TOKEN_PREFIX, credential_record_name
 from nemo_evals.trial_spans import export_request, trial_root_span
+from nemo_evals.trial_tokens import TOKEN_LIFETIME_SEC, ModelAccess, TrialClaims, TrialPolicy, unsigned_trial_token
 from nemo_helix_plugin.auth.access_keys.client import AsyncAccessKeysClient
 from nemo_helix_plugin.auth.access_keys.types import AccessKeyCreateRequest
 from nemo_helix_plugin.client.client import AsyncNemoClient
@@ -65,49 +60,36 @@ CREDENTIAL_ENV_KWARG = "trial_attribution_env"
 
 REQUEST_TIMEOUT_SEC = 10.0
 ACCESS_KEY_SCOPE = "inference"
-ACCESS_KEY_LIFETIME_SEC = 24 * 60 * 60
-
-
-@dataclass(frozen=True)
-class TrialIdentity:
-    """The Intake session, trace and root span every producer of one trial's spans shares."""
-
-    session_id: str
-    trace_id: str
-    root_span_id: str
-
-    @classmethod
-    def of(cls, run_id: str, trial_name: str) -> TrialIdentity:
-        """The identity of trial ``trial_name`` in SDK run ``run_id``: the session publishing already uses."""
-        session_id = session_id_for(run_id, trial_name)
-        digest = hashlib.sha256(session_id.encode()).hexdigest()
-        return cls(session_id=session_id, trace_id=digest[:32], root_span_id=digest[32:48])
+ACCESS_KEY_NAME_PREFIX = "nemo-evals-trial "
 
 
 @dataclass(frozen=True)
 class IssuedCredential:
     credential: str
-    digest: str
+    trial: TrialClaims
     access_key_jti: str | None
 
 
 class TrialCredentialIssuer:
-    """Issues trials their gateway credentials and records them in the gateway model's workspace."""
+    """Issues trials their trial tokens, and records each trial's root span in Intake when its token ends."""
 
     def __init__(
         self,
         client: AsyncNemoClient,
         *,
         run_id: str,
-        credential_workspace: str,
         intake_workspace: str,
         evaluation_name: str | None = None,
+        model_access: ModelAccess = ModelAccess.OPEN,
     ) -> None:
         self._client = client
         self._run_id = run_id
-        self._credential_workspace = credential_workspace
         self._intake_workspace = intake_workspace
         self._evaluation_name = evaluation_name
+        self._policy = TrialPolicy(model_access=model_access)
+        self._lock = threading.Lock()
+        self._attempts: dict[str, int] = {}
+        self._first_issued_at: dict[str, datetime] = {}
 
     @contextlib.asynccontextmanager
     async def _platform(self) -> AsyncGenerator[AsyncNemoClient]:
@@ -116,36 +98,58 @@ class TrialCredentialIssuer:
         async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SEC, event_hooks=event_hooks) as http_client:
             yield self._client.with_http_client(http_client)
 
+    def _next_attempt(self, trial_dir: Path) -> TrialClaims:
+        session = session_id_for(self._run_id, trial_dir.name)
+        with self._lock:
+            attempt = self._attempts.get(session, 0)
+            self._attempts[session] = attempt + 1
+            self._first_issued_at.setdefault(session, datetime.now(UTC))
+        return TrialClaims(
+            session=session,
+            attempt=attempt,
+            intake_workspace=self._intake_workspace,
+            evaluation=self._evaluation_name,
+            task=_test_case_name(trial_dir),
+            policy=self._policy,
+        )
+
     async def issue(self, trial_dir: Path, *, agent_key: str | None) -> IssuedCredential | None:
-        """A credential for the trial in ``trial_dir``, recorded as the trial's; ``None`` to keep ``agent_key``."""
-        identity = TrialIdentity.of(self._run_id, trial_dir.name)
-        issued: IssuedCredential | None = None
+        """A trial token for the trial in ``trial_dir``; ``None`` to keep ``agent_key``."""
+        try:
+            trial = self._next_attempt(trial_dir)
+            if agent_key is None or agent_key == GATEWAY_PLACEHOLDER_KEY:
+                return IssuedCredential(unsigned_trial_token(trial), trial, None)
+            async with asyncio.timeout(REQUEST_TIMEOUT_SEC * 2), self._platform() as client:
+                key = (
+                    await AsyncAccessKeysClient.from_client(client).create_access_key(
+                        body=AccessKeyCreateRequest(
+                            name=f"{ACCESS_KEY_NAME_PREFIX}{trial.session}"[:128],
+                            description="Inference Gateway key for one evaluation trial; revoked when the trial ends.",
+                            expires_in_seconds=TOKEN_LIFETIME_SEC,
+                            scope=[ACCESS_KEY_SCOPE],
+                            service_attributes=trial.service_attributes(),
+                        )
+                    )
+                ).data()
+        except Exception:
+            logger.warning("Could not issue trial %s its own gateway credential", trial_dir.name, exc_info=True)
+            return None
+        return IssuedCredential(key.token, trial, key.jti)
+
+    async def end(self, issued: IssuedCredential) -> None:
+        """End the token now: record the trial's root span, then revoke a minted key."""
+        trial = issued.trial
+        started_at = self._first_issued_at.get(trial.session, datetime.now(UTC))
         try:
             async with asyncio.timeout(REQUEST_TIMEOUT_SEC * 2), self._platform() as client:
-                if agent_key is None or agent_key == GATEWAY_PLACEHOLDER_KEY:
-                    issued = _random_credential()
-                else:
-                    issued = await _access_key(client, identity.session_id)
-                body = CreateTrialCredentialRequest(
-                    name=issued.digest,
-                    session_id=identity.session_id,
-                    trace_id=identity.trace_id,
-                    root_span_id=identity.root_span_id,
-                    intake_workspace=self._intake_workspace,
-                    started_at=datetime.now(UTC),
-                    evaluation_name=self._evaluation_name,
-                    test_case_name=_test_case_name(trial_dir),
+                root = trial_root_span(trial, started_at=started_at, ended_at=datetime.now(UTC))
+                await AsyncIntakeClient.from_client(client).create_otlp_traces(
+                    workspace=trial.intake_workspace, content=export_request([root])
                 )
-                evals = AsyncTrialCredentialsClient.from_client(client)
-                (await evals.create_trial_credential(workspace=self._credential_workspace, body=body)).data()
-        except BaseException as e:
-            if issued is not None and issued.access_key_jti is not None:
-                await asyncio.shield(self._revoke(issued.access_key_jti))
-            if not isinstance(e, Exception):
-                raise
-            logger.warning("Could not issue trial %s its own gateway credential", identity.session_id, exc_info=True)
-            return None
-        return issued
+        except Exception:
+            logger.warning("Could not record the root span of trial %s", trial.session, exc_info=True)
+        if issued.access_key_jti is not None:
+            await self._revoke(issued.access_key_jti)
 
     async def _revoke(self, jti: str) -> None:
         try:
@@ -153,42 +157,6 @@ class TrialCredentialIssuer:
                 await AsyncAccessKeysClient.from_client(client).revoke_access_key(jti=jti)
         except Exception:
             logger.warning("Could not revoke a trial's access key %s", jti, exc_info=True)
-
-    async def end(self, issued: IssuedCredential) -> None:
-        """End the credential now: record the trial's root span, then revoke a minted key."""
-        try:
-            async with asyncio.timeout(REQUEST_TIMEOUT_SEC * 2), self._platform() as client:
-                evals = AsyncTrialCredentialsClient.from_client(client)
-                trial = (
-                    await evals.end_trial_credential(
-                        workspace=self._credential_workspace,
-                        name=issued.digest,
-                        body=EndTrialCredentialRequest(ended_at=datetime.now(UTC)),
-                    )
-                ).data()
-                await AsyncIntakeClient.from_client(client).create_otlp_traces(
-                    workspace=trial.intake_workspace, content=export_request([trial_root_span(trial)])
-                )
-        except Exception:
-            logger.warning("Could not end a trial's gateway credential", exc_info=True)
-        if issued.access_key_jti is not None:
-            await self._revoke(issued.access_key_jti)
-
-
-def _random_credential() -> IssuedCredential:
-    credential = TRIAL_TOKEN_PREFIX + secrets.token_urlsafe(32)
-    return IssuedCredential(credential, credential_record_name(credential), None)
-
-
-async def _access_key(client: AsyncNemoClient, session_id: str) -> IssuedCredential:
-    request = AccessKeyCreateRequest(
-        name=f"{TRIAL_ACCESS_KEY_NAME_PREFIX}{session_id}"[:128],
-        description="Inference Gateway key for one evaluation trial; revoked when the trial ends.",
-        expires_in_seconds=ACCESS_KEY_LIFETIME_SEC,
-        scope=[ACCESS_KEY_SCOPE],
-    )
-    key = (await AsyncAccessKeysClient.from_client(client).create_access_key(body=request)).data()
-    return IssuedCredential(key.token, credential_record_name(key.token), key.jti)
 
 
 def _test_case_name(trial_dir: Path) -> str | None:

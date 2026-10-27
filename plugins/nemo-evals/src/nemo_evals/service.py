@@ -15,7 +15,6 @@ from nemo_evals.api.v2 import results as results_routes
 from nemo_evals.api.v2 import tasks as tasks_routes
 from nemo_evals.api.v2 import taskset_runs as taskset_run_routes
 from nemo_evals.api.v2 import tasksets as tasksets_routes
-from nemo_evals.api.v2 import trial_credentials as trial_credential_routes
 from nemo_evals.authz import scope
 from nemo_evals.core import say_hello
 from nemo_evals.jobs.agent_evaluate import AgentEvalJob
@@ -160,13 +159,6 @@ class EvaluatorPluginService(NemoService):
                 router=live_routes.router,
                 tag="Evals Plugin Live Evaluation Route",
                 description="Single-row evaluation run in-process, without creating a job.",
-                prefix="/v2/workspaces/{workspace}",
-            ),
-            RouterSpec(
-                # /apis/evals/v2/workspaces/{workspace}/trial-credentials.
-                router=trial_credential_routes.router,
-                tag="Evals Plugin Trial Credential Routes",
-                description="Which trial each credential issued for the Inference Gateway belongs to.",
                 prefix="/v2/workspaces/{workspace}",
             ),
             RouterSpec(

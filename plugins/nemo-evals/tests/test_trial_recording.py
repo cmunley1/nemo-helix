@@ -1,56 +1,46 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Each call made with a trial's credential is recorded in that trial, without touching the call."""
+"""Each call made with a trial token is recorded in that trial, without touching the call."""
 
 from __future__ import annotations
 
 import asyncio
-import base64
-import json
-import re
 import time
-from collections.abc import AsyncIterator
-from datetime import UTC, datetime, timedelta
+from collections.abc import AsyncIterator, Mapping
+from datetime import UTC, datetime
 from importlib.metadata import entry_points
 from typing import Any
 
 import pytest
-from nemo_evals.trial_credential_records import TrialCredential
+from nemo_evals import trial_recording
 from nemo_evals.trial_recording import (
     MIDDLEWARE_NAME,
-    TRIAL_ACCESS_KEY_NAME_PREFIX,
-    TRIAL_TOKEN_PREFIX,
     CallApi,
     CallRecorder,
     FinishedCall,
     TokenUsage,
-    TrialCache,
     TrialRecordingConfig,
     TrialRecordingMiddleware,
     caller_credential,
-    credential_record_name,
-    is_trial_credential,
     usage_from_payload,
 )
-from nemo_evals.trial_spans import GATEWAY_CALL_ATTRIBUTE, SESSION_ATTRIBUTE, TEST_CASE_ATTRIBUTE
-from nemo_helix_plugin.entity_naming import NAME_PATTERN
+from nemo_evals.trial_spans import ATTEMPT_ATTRIBUTE, GATEWAY_CALL_ATTRIBUTE, SESSION_ATTRIBUTE, TEST_CASE_ATTRIBUTE
+from nemo_evals.trial_tokens import ModelAccess, TrialClaims, TrialPolicy, TrialTokenReader, unsigned_trial_token
+from nemo_helix_plugin.client.oidc import decode_jwt_claims
 from nemo_helix_plugin.inference_middleware import InferenceMiddlewareContext, InferenceRequest, InferenceResponse
 from opentelemetry.proto.trace.v1.trace_pb2 import ResourceSpans, Span
 
-CREDENTIAL = f"{TRIAL_TOKEN_PREFIX}token"
 NOW = datetime.now(UTC)
-TRIAL = TrialCredential(
-    name=credential_record_name(CREDENTIAL),
-    workspace="models",
-    session_id="run-1:hello__abc",
-    trace_id="0af7651916cd43dd8448eb211c80319c",
-    root_span_id="b7ad6b7169203331",
+TRIAL = TrialClaims(
+    session="run-1:hello__abc",
+    attempt=1,
     intake_workspace="evals",
-    started_at=NOW - timedelta(hours=1),
-    evaluation_name="run-1",
-    test_case_name="hello",
+    evaluation="run-1",
+    task="hello",
+    policy=TrialPolicy(model_access=ModelAccess.OPEN),
 )
+TOKEN = unsigned_trial_token(TRIAL)
 
 
 def _value(value: Any) -> Any:
@@ -71,16 +61,16 @@ def _spans(batches: list[tuple[str, list[ResourceSpans]]]) -> list[tuple[str, Sp
     ]
 
 
-class Trials:
-    """A lookup that answers from a fixed set of trials and counts what it was asked."""
+class Signed:
+    """Stands in for the platform's signature check: trusts the claims of exactly the tokens it was given."""
 
-    def __init__(self, *trials: TrialCredential) -> None:
-        self._trials = {(trial.workspace, trial.name): trial for trial in trials}
+    def __init__(self, *tokens: str) -> None:
+        self._tokens = set(tokens)
         self.asked = 0
 
-    async def __call__(self, workspace: str, digest: str) -> TrialCredential | None:
+    async def __call__(self, token: str) -> Mapping[str, Any] | None:
         self.asked += 1
-        return self._trials.get((workspace, digest))
+        return decode_jwt_claims(token) if token in self._tokens else None
 
 
 class Sink:
@@ -92,9 +82,13 @@ class Sink:
         return 0
 
 
-def _middleware(lookup: Trials, sink: Sink) -> TrialRecordingMiddleware:
+def _reader(*tokens: str) -> TrialTokenReader:
+    return TrialTokenReader(Signed(*tokens))
+
+
+def _middleware(reader: TrialTokenReader, sink: Sink) -> TrialRecordingMiddleware:
     middleware = TrialRecordingMiddleware()
-    middleware._recorder = CallRecorder(TrialCache(lookup), sink, flush_interval_sec=60)
+    middleware._recorder = CallRecorder(reader, sink, flush_interval_sec=60)
     return middleware
 
 
@@ -145,57 +139,47 @@ def test_the_credential_is_the_bearer_token_or_else_the_api_key(
     assert caller_credential(headers) == credential
 
 
-@pytest.mark.parametrize("credential", [f"{TRIAL_TOKEN_PREFIX}abc", "0" * 40, "eyJ.a.b"])
-def test_a_credential_is_recorded_under_a_valid_entity_name(credential: str) -> None:
-    """Records live in the entity store, which refuses names over 63 characters or starting with a digit."""
-    name = credential_record_name(credential)
+@pytest.mark.parametrize("auth_enabled", [True, False], ids=["auth on", "auth off"])
+async def test_the_gateway_trusts_signed_tokens_with_auth_on_and_unsigned_ones_with_it_off(
+    monkeypatch: pytest.MonkeyPatch, auth_enabled: bool
+) -> None:
+    """With auth on, an unsigned token naming a trial is ignored, even when the gateway accepted it."""
+    monkeypatch.setattr(trial_recording, "platform_auth_enabled", lambda: auth_enabled)
 
-    assert re.fullmatch(NAME_PATTERN, name)
-    assert name != credential_record_name(credential + "x")
+    async def nothing_is_signed(token: str) -> None:
+        return None
 
-
-def _jwt(claims: dict[str, Any]) -> str:
-    payload = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=")
-    return f"eyJhbGciOiJSUzI1NiJ9.{payload}.c2lnbmF0dXJl"
-
-
-@pytest.mark.parametrize(
-    ("credential", "marked"),
-    [
-        pytest.param(f"{TRIAL_TOKEN_PREFIX}abc", True, id="trial token"),
-        pytest.param(
-            _jwt({"nhx_access_key": {"name": f"{TRIAL_ACCESS_KEY_NAME_PREFIX}run-1:t"}}), True, id="trial key"
-        ),
-        pytest.param(_jwt({"nhx_access_key": {"name": "my laptop"}}), False, id="another access key"),
-        pytest.param(_jwt({"sub": "user@example.com"}), False, id="a token that is no access key"),
-        pytest.param("inference-gateway-no-key", False, id="the placeholder"),
-        pytest.param("a.!!!.c", False, id="not a JWT"),
-        pytest.param("e30.WyJ4Il0.c2ln", False, id="claims that are no object"),
-    ],
-)
-def test_only_a_credential_marked_as_a_trials_is_one(credential: str, marked: bool) -> None:
-    assert is_trial_credential(credential) is marked
+    monkeypatch.setattr(trial_recording, "verified_access_key_claims", nothing_is_signed)
+    middleware = TrialRecordingMiddleware()
+    monkeypatch.setattr(middleware, "_get_platform_client", lambda hook: object())
+    monkeypatch.setattr(trial_recording, "intake_sink", lambda client: Sink())
+    await middleware.on_startup()
+    try:
+        assert middleware._recorder is not None
+        assert (await middleware._recorder._trials.trial(TOKEN) == TRIAL) is not auth_enabled
+    finally:
+        await middleware.on_shutdown()
 
 
-async def test_a_call_with_an_unmarked_credential_is_never_looked_up() -> None:
-    """Most callers aren't trials, so the lookup in evals happens only for credentials marked as a trial's."""
-    lookup, sink = Trials(TRIAL), Sink()
-    middleware = _middleware(lookup, sink)
+async def test_a_call_with_a_token_naming_no_trial_is_never_checked() -> None:
+    """Most callers aren't trials, so only tokens that claim a trial reach the signature check."""
+    verify, sink = Signed(TOKEN), Sink()
+    middleware = _middleware(TrialTokenReader(verify), sink)
 
     await _call(middleware, _ctx({"authorization": "Bearer users-own-key"}), {"usage": {"prompt_tokens": 1}})
     assert middleware._recorder is not None
     await middleware._recorder.flush()
 
-    assert lookup.asked == 0
+    assert verify.asked == 0
     assert sink.sent == []
 
 
-async def test_a_call_made_with_a_trials_credential_is_recorded_in_the_trial() -> None:
-    lookup, sink = Trials(TRIAL), Sink()
-    middleware = _middleware(lookup, sink)
+async def test_a_call_made_with_a_trial_token_is_recorded_in_the_trial() -> None:
+    sink = Sink()
+    middleware = _middleware(_reader(TOKEN), sink)
     body = {"choices": [], "usage": {"prompt_tokens": 120, "completion_tokens": 5}}
 
-    assert await _call(middleware, _ctx({"authorization": f"Bearer {CREDENTIAL}"}), body) is body
+    assert await _call(middleware, _ctx({"authorization": f"Bearer {TOKEN}"}), body) is body
     assert middleware._recorder is not None
     await middleware._recorder.flush()
 
@@ -205,8 +189,9 @@ async def test_a_call_made_with_a_trials_credential_is_recorded_in_the_trial() -
     assert span.parent_span_id.hex() == TRIAL.root_span_id
     assert span.name == "chat.completions"
     attributes = _attributes(span)
-    assert attributes[SESSION_ATTRIBUTE] == TRIAL.session_id
+    assert attributes[SESSION_ATTRIBUTE] == TRIAL.session
     assert attributes[TEST_CASE_ATTRIBUTE] == "hello"
+    assert attributes[ATTEMPT_ATTRIBUTE] == 1
     assert attributes[GATEWAY_CALL_ATTRIBUTE] is True
     assert attributes["gen_ai.usage.input_tokens"] == 120
     assert attributes["gen_ai.usage.output_tokens"] == 5
@@ -217,13 +202,16 @@ async def test_a_call_made_with_a_trials_credential_is_recorded_in_the_trial() -
 @pytest.mark.parametrize(
     "headers",
     [
-        pytest.param({"authorization": f"Bearer {TRIAL_TOKEN_PREFIX}other"}, id="no trial holds the credential"),
+        pytest.param(
+            {"authorization": f"Bearer {unsigned_trial_token(TRIAL.model_copy(update={'attempt': 2}))}"},
+            id="a trial token the platform didn't sign",
+        ),
         pytest.param({}, id="no credential"),
     ],
 )
-async def test_a_call_without_a_trials_credential_is_not_recorded(headers: dict[str, str]) -> None:
+async def test_a_call_without_a_trusted_trial_token_is_not_recorded(headers: dict[str, str]) -> None:
     sink = Sink()
-    middleware = _middleware(Trials(TRIAL), sink)
+    middleware = _middleware(_reader(TOKEN), sink)
 
     await _call(middleware, _ctx(headers), {"usage": {"prompt_tokens": 1}})
     assert middleware._recorder is not None
@@ -232,27 +220,15 @@ async def test_a_call_without_a_trials_credential_is_not_recorded(headers: dict[
     assert sink.sent == []
 
 
-async def test_a_call_after_the_trial_ended_is_not_recorded() -> None:
-    ended = TRIAL.model_copy(update={"ended_at": NOW - timedelta(minutes=1)})
-    sink = Sink()
-    middleware = _middleware(Trials(ended), sink)
-
-    await _call(middleware, _ctx({"authorization": f"Bearer {CREDENTIAL}"}), {"usage": {"prompt_tokens": 1}})
-    assert middleware._recorder is not None
-    await middleware._recorder.flush()
-
-    assert sink.sent == []
-
-
 async def test_a_streamed_call_is_recorded_with_its_usage_once_the_caller_has_it_all() -> None:
     sink = Sink()
-    middleware = _middleware(Trials(TRIAL), sink)
+    middleware = _middleware(_reader(TOKEN), sink)
     chunks = [
         {"type": "message_start", "message": {"usage": {"input_tokens": 10, "cache_read_input_tokens": 30}}},
         {"type": "message_delta", "usage": {"output_tokens": 15}},
     ]
 
-    stream = await _call(middleware, _ctx({"x-api-key": CREDENTIAL}, path="v1/messages"), _stream(*chunks))
+    stream = await _call(middleware, _ctx({"x-api-key": TOKEN}, path="v1/messages"), _stream(*chunks))
     assert middleware._recorder is not None
     assert middleware._recorder._queue.empty()
     assert [chunk async for chunk in stream] == chunks
@@ -268,9 +244,9 @@ async def test_a_streamed_call_is_recorded_with_its_usage_once_the_caller_has_it
 
 async def test_a_caller_that_stops_reading_mid_stream_is_recorded_as_cancelled() -> None:
     sink = Sink()
-    middleware = _middleware(Trials(TRIAL), sink)
+    middleware = _middleware(_reader(TOKEN), sink)
 
-    stream = await _call(middleware, _ctx({"authorization": f"Bearer {CREDENTIAL}"}), _stream({"a": 1}, {"b": 2}))
+    stream = await _call(middleware, _ctx({"authorization": f"Bearer {TOKEN}"}), _stream({"a": 1}, {"b": 2}))
     assert await anext(stream) == {"a": 1}
     await stream.aclose()
     assert middleware._recorder is not None
@@ -282,8 +258,8 @@ async def test_a_caller_that_stops_reading_mid_stream_is_recorded_as_cancelled()
 
 async def test_the_span_starts_when_the_gateway_received_the_call() -> None:
     sink = Sink()
-    middleware = _middleware(Trials(TRIAL), sink)
-    ctx = _ctx({"authorization": f"Bearer {CREDENTIAL}"})
+    middleware = _middleware(_reader(TOKEN), sink)
+    ctx = _ctx({"authorization": f"Bearer {TOKEN}"})
     config = TrialRecordingConfig()
 
     await middleware.process_request(ctx, ctx.original_request, config)
@@ -296,34 +272,22 @@ async def test_the_span_starts_when_the_gateway_received_the_call() -> None:
     assert span.start_time_unix_nano == int(received.timestamp() * 1_000_000_000)
 
 
-async def test_a_credentials_trial_is_looked_up_once_while_cached() -> None:
-    lookup = Trials(TRIAL)
-    cache = TrialCache(lookup, ttl_sec=60)
-
-    assert await cache.trial("models", TRIAL.name) == TRIAL
-    assert await cache.trial("models", TRIAL.name) == TRIAL
-    assert await cache.trial("models", "0" * 64) is None
-    assert await cache.trial("models", "0" * 64) is None
-
-    assert lookup.asked == 2
+def _finished(token: str = TOKEN, name: str = "chat.completions") -> FinishedCall:
+    return FinishedCall(token=token, name=name, started_at=NOW, ended_at=NOW, cancelled=False)
 
 
-def _finished(digest: str = TRIAL.name, name: str = "chat.completions") -> FinishedCall:
-    return FinishedCall(workspace="models", digest=digest, name=name, started_at=NOW, ended_at=NOW, cancelled=False)
-
-
-async def test_a_failed_lookup_drops_the_call_and_keeps_recording() -> None:
+async def test_a_token_that_cant_be_checked_drops_the_call_and_keeps_recording() -> None:
     failed = False
 
-    async def flaky(workspace: str, digest: str) -> TrialCredential | None:
+    async def flaky(token: str) -> Mapping[str, Any] | None:
         nonlocal failed
         if not failed:
             failed = True
-            raise RuntimeError("evals is down")
-        return TRIAL
+            raise RuntimeError("the platform's signing keys are unreachable")
+        return decode_jwt_claims(token)
 
     sink = Sink()
-    recorder = CallRecorder(TrialCache(flaky, ttl_sec=0), sink, flush_interval_sec=60)
+    recorder = CallRecorder(TrialTokenReader(flaky), sink, flush_interval_sec=60)
     recorder.record(_finished(name="1"))
     recorder.record(_finished(name="2"))
     await recorder.flush()
@@ -444,12 +408,12 @@ def test_api_is_read_from_the_path(path: str, api: CallApi) -> None:
 
 
 async def test_queued_calls_are_sent_in_one_batch_per_intake_workspace() -> None:
-    other = TRIAL.model_copy(update={"name": "1" * 64, "intake_workspace": "other"})
+    other = unsigned_trial_token(TRIAL.model_copy(update={"intake_workspace": "other"}))
     sink = Sink()
-    recorder = CallRecorder(TrialCache(Trials(TRIAL, other)), sink, flush_interval_sec=0.05)
+    recorder = CallRecorder(_reader(TOKEN, other), sink, flush_interval_sec=0.05)
     recorder.start()
     recorder.record(_finished(name="1"))
-    recorder.record(_finished(digest=other.name, name="2"))
+    recorder.record(_finished(token=other, name="2"))
     recorder.record(_finished(name="3"))
     await asyncio.sleep(0.2)
     await recorder.stop()
@@ -463,7 +427,7 @@ async def test_queued_calls_are_sent_in_one_batch_per_intake_workspace() -> None
 async def test_stopping_sends_the_calls_the_sender_was_still_collecting() -> None:
     """The sender holds a batch for up to the flush interval; shutting the gateway down mustn't lose it."""
     sink = Sink()
-    recorder = CallRecorder(TrialCache(Trials(TRIAL)), sink, flush_interval_sec=60)
+    recorder = CallRecorder(_reader(TOKEN), sink, flush_interval_sec=60)
     recorder.start()
     recorder.record(_finished(name="1"))
     recorder.record(_finished(name="2"))
@@ -476,10 +440,8 @@ async def test_stopping_sends_the_calls_the_sender_was_still_collecting() -> Non
 
 
 async def test_a_batch_is_split_to_fit_intakes_body_limit(monkeypatch: pytest.MonkeyPatch) -> None:
-    from nemo_evals import trial_recording
-
     sink = Sink()
-    recorder = CallRecorder(TrialCache(Trials(TRIAL)), sink, flush_interval_sec=60)
+    recorder = CallRecorder(_reader(TOKEN), sink, flush_interval_sec=60)
     for name in "12345":
         recorder.record(_finished(name=name))
     one_span = await recorder._span(_finished(name="1"))
@@ -500,7 +462,7 @@ async def test_an_unreachable_intake_never_blocks_recording_and_drops_its_batche
         await asyncio.Event().wait()
         return 0
 
-    recorder = CallRecorder(TrialCache(Trials(TRIAL)), hanging_sink, max_queued_calls=2, flush_interval_sec=0.01)
+    recorder = CallRecorder(_reader(TOKEN), hanging_sink, max_queued_calls=2, flush_interval_sec=0.01)
     recorder.start()
     recorder.record(_finished())
     await asyncio.sleep(0.05)  # the sender is now stuck on that call's batch
@@ -525,7 +487,7 @@ async def test_a_failing_intake_drops_the_batch_and_keeps_sending() -> None:
         sent.append(len(spans))
         return 0
 
-    recorder = CallRecorder(TrialCache(Trials(TRIAL)), flaky_sink, flush_interval_sec=0.01)
+    recorder = CallRecorder(_reader(TOKEN), flaky_sink, flush_interval_sec=0.01)
     recorder.start()
     recorder.record(_finished())
     await asyncio.sleep(0.05)
@@ -541,7 +503,7 @@ async def test_spans_intake_rejects_are_counted_as_dropped() -> None:
     async def picky_sink(workspace: str, spans: list[ResourceSpans]) -> int:
         return 1
 
-    recorder = CallRecorder(TrialCache(Trials(TRIAL)), picky_sink, flush_interval_sec=60)
+    recorder = CallRecorder(_reader(TOKEN), picky_sink, flush_interval_sec=60)
     recorder.record(_finished())
     recorder.record(_finished())
     await recorder.flush()
@@ -560,7 +522,7 @@ async def test_stop_is_bounded_even_when_the_sink_ignores_cancellation() -> None
                 continue
         return 0
 
-    recorder = CallRecorder(TrialCache(Trials(TRIAL)), stubborn_sink, flush_interval_sec=0.01)
+    recorder = CallRecorder(_reader(TOKEN), stubborn_sink, flush_interval_sec=0.01)
     recorder.start()
     recorder.record(_finished())
     await asyncio.sleep(0.05)

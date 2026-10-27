@@ -350,10 +350,12 @@ another middleware makes on its own, such as the judge calls of the `nemo-switch
 
 ## Record Evaluation Trials
 
-An agent evaluation gives each Harbor trial that calls a gateway model its own credential. The
-`nemo-evals-trial-recording` middleware uses that credential to record each of the trial's model
-calls in Intake, as a span in the trial's trace with the token usage the provider reported. It
-doesn't change, delay or fail the call, and calls made with any other credential aren't recorded.
+An agent evaluation gives each Harbor trial that calls a gateway model its own trial token, a
+credential that names the trial. The `nemo-evals-trial-recording` middleware reads the token to
+record each of the trial's model calls in Intake, as a span in the trial's trace with the token usage
+the provider reported and which attempt at the trial made it. It doesn't change, delay or fail the
+call, and calls made with any other credential aren't recorded. With platform auth on, it trusts
+only trial tokens the platform signed.
 
 It takes no settings. Add it to `request_middleware`, so a call's span starts when the call arrives,
 and to `response_middleware`, where each call is recorded:
@@ -376,7 +378,7 @@ must be enabled. If a key can't be minted, the trial uses your key and its calls
 Calls the model provider rejects aren't recorded either.
 
 With platform auth on, the middleware also needs its service principal allowed, or the platform
-refuses its lookups and Intake writes and no calls are recorded:
+refuses its Intake writes and no calls are recorded:
 
 ```yaml
 auth:

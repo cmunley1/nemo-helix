@@ -32,7 +32,7 @@ from nemo_evals.shared.metric_bundles.bundles import BundledMetricOutputSpec
 from nemo_helix_plugin.entities import EntityBase
 from nhx_evals_sdk.values.common import SecretRef
 from nhx_evals_sdk.values.results import AggregatedMetricResult
-from pydantic import AwareDatetime, BaseModel, Field
+from pydantic import BaseModel, Field
 
 # Constants are intentionally local: nhx_common's entity constants are not
 # re-exported to plugins. Keep these aligned with
@@ -396,18 +396,3 @@ class TasksetRevisionEntity(_RevisionCommon, EntityBase):
         "a Files reference already names an exact location.",
     )
     metadata: TaskMetadataList = Field(default_factory=list, description="Key/value annotations for the taskset.")
-
-
-class TrialCredentialEntity(EntityBase):
-    """The trial a credential was issued to, named ``cred-`` and the first 58 hex digits of the credential's SHA-256."""
-
-    __entity_type__: ClassVar[str] = "trial_credential"
-
-    session_id: str = Field(description="The trial's Intake session.")
-    trace_id: str = Field(description="The trial's trace id.")
-    root_span_id: str = Field(description="The trial's root span id.")
-    intake_workspace: str = Field(description="The workspace the trial's spans are recorded in.")
-    started_at: AwareDatetime = Field(description="When the trial was issued the credential.")
-    ended_at: AwareDatetime | None = Field(default=None, description="When the trial stopped using the credential.")
-    evaluation_name: str | None = Field(default=None, description="The Intake evaluation the trial belongs to.")
-    test_case_name: str | None = Field(default=None, description="The Intake test case the trial runs.")

@@ -1,16 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Each Harbor trial calls the gateway with its own credential, recorded as the trial's and ended with it."""
+"""Each Harbor trial calls the gateway with its own trial token, which names the trial and ends with it."""
 
 from __future__ import annotations
 
-import asyncio
 import contextlib
-import hashlib
 import json
 from collections.abc import Generator
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -27,34 +24,35 @@ from nemo_evals.harbor.trial_credentials import (
     TRIAL_CREDENTIAL_AGENT,
     IssuedCredential,
     TrialCredentialIssuer,
-    TrialIdentity,
     issuing,
     with_trial_credentials,
 )
 from nemo_evals.intake.mapping import session_id_for
 from nemo_evals.jobs.gateway_agents import GATEWAY_PLACEHOLDER_KEY
-from nemo_evals.trial_recording import TRIAL_ACCESS_KEY_NAME_PREFIX, is_trial_credential
+from nemo_evals.trial_tokens import (
+    TOKEN_LIFETIME_SEC,
+    ModelAccess,
+    TrialClaims,
+    TrialPolicy,
+    TrialTokenReader,
+    unsigned_trial_token,
+)
 from nemo_helix_plugin.client.client import AsyncNemoClient
 from nhx_evals_sdk.agent_eval.runtimes.harbor.runtime import HarborRuntimeConfig
 from nhx_evals_sdk.agent_eval.runtimes.provenance import require_no_plaintext_credentials
 from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import ExportTraceServiceRequest
+from opentelemetry.proto.trace.v1.trace_pb2 import Span
 
 TRIAL = "hello-world__AbC123"
 RUN = "run-1-task-0"
 KEY_ENV = "OPENAI_API_KEY"
-
-
-def _digest(credential: str) -> str:
-    return "cred-" + hashlib.sha256(credential.encode()).hexdigest()[:58]
-
-
-def test_a_trials_identity_is_the_session_publishing_uses_and_is_stable() -> None:
-    identity = TrialIdentity.of(RUN, TRIAL)
-
-    assert identity.session_id == session_id_for(RUN, TRIAL)
-    assert identity == TrialIdentity.of(RUN, TRIAL)
-    assert len(identity.trace_id) == 32 and len(identity.root_span_id) == 16
-    assert TrialIdentity.of(RUN, "other__x").trace_id != identity.trace_id
+CLAIMS = TrialClaims(
+    session=session_id_for(RUN, TRIAL),
+    attempt=0,
+    intake_workspace="evals",
+    evaluation="run-1",
+    policy=TrialPolicy(model_access=ModelAccess.CLOSED),
+)
 
 
 class Platform:
@@ -72,23 +70,8 @@ class Platform:
         return [request.content for request in self.seen if request.method == method and request.url.path == path]
 
 
-CREDENTIALS = "/apis/evals/v2/workspaces/models/trial-credentials"
 ACCESS_KEYS = "/apis/auth/v2/access-keys"
 OTLP = "/apis/intake/v2/workspaces/evals/ingest/otlp/v1/traces"
-
-
-def _trial_json(digest: str, **overrides: Any) -> dict[str, Any]:
-    identity = TrialIdentity.of(RUN, TRIAL)
-    return {
-        "name": digest,
-        "workspace": "models",
-        "session_id": identity.session_id,
-        "trace_id": identity.trace_id,
-        "root_span_id": identity.root_span_id,
-        "intake_workspace": "evals",
-        "started_at": datetime(2026, 10, 26, 12, tzinfo=UTC).isoformat(),
-        **overrides,
-    }
 
 
 @pytest.fixture
@@ -107,35 +90,29 @@ def _issuer() -> TrialCredentialIssuer:
     return TrialCredentialIssuer(
         AsyncNemoClient(base_url="http://platform.test"),
         run_id=RUN,
-        credential_workspace="models",
         intake_workspace="evals",
         evaluation_name="run-1",
+        model_access=ModelAccess.CLOSED,
     )
 
 
-def _trial_dir(tmp_path: Path) -> Path:
-    trial_dir = tmp_path / TRIAL
-    trial_dir.mkdir()
+def _trial_dir(tmp_path: Path, name: str = TRIAL) -> Path:
+    trial_dir = tmp_path / name
+    trial_dir.mkdir(exist_ok=True)
     return trial_dir
 
 
 @pytest.mark.parametrize("agent_key", [GATEWAY_PLACEHOLDER_KEY, None])
-async def test_without_a_user_key_a_trial_gets_a_random_token(
+async def test_without_a_user_key_a_trial_gets_an_unsigned_trial_token(
     platform: Platform, tmp_path: Path, agent_key: str | None
 ) -> None:
-    """Platform auth is off whenever the agent holds the placeholder: the gateway only needs a unique value."""
-    platform.answers[("POST", CREDENTIALS)] = httpx.Response(200, json=_trial_json("cred-" + "a" * 58))
-
+    """Platform auth is off whenever the agent holds the placeholder, so there is no key to sign a token."""
     issued = await _issuer().issue(_trial_dir(tmp_path), agent_key=agent_key)
 
     assert issued is not None and issued.access_key_jti is None
-    assert issued.credential not in {GATEWAY_PLACEHOLDER_KEY, None}
-    assert is_trial_credential(issued.credential)
-    [body] = [json.loads(content) for content in platform.bodies("POST", CREDENTIALS)]
-    assert body["name"] == _digest(issued.credential)
-    assert body["session_id"] == session_id_for(RUN, TRIAL)
-    assert body["intake_workspace"] == "evals" and body["evaluation_name"] == "run-1"
-    assert platform.bodies("POST", ACCESS_KEYS) == []
+    assert issued.trial == CLAIMS
+    assert await TrialTokenReader(None).trial(issued.credential) == CLAIMS
+    assert platform.seen == []
 
 
 def _minted(token: str = "minted-token", jti: str = "ak_" + "1" * 32) -> httpx.Response:
@@ -155,99 +132,81 @@ def _minted(token: str = "minted-token", jti: str = "ak_" + "1" * 32) -> httpx.R
     )
 
 
-async def test_with_a_user_key_a_trial_gets_its_own_inference_scoped_access_key(
+async def test_with_a_user_key_a_trial_gets_an_access_key_carrying_its_claims(
     platform: Platform, tmp_path: Path
 ) -> None:
     platform.answers[("POST", ACCESS_KEYS)] = _minted()
-    platform.answers[("POST", CREDENTIALS)] = httpx.Response(200, json=_trial_json(_digest("minted-token")))
 
     issued = await _issuer().issue(_trial_dir(tmp_path), agent_key="users-own-key")
 
-    assert issued == IssuedCredential("minted-token", _digest("minted-token"), "ak_" + "1" * 32)
+    assert issued == IssuedCredential("minted-token", CLAIMS, "ak_" + "1" * 32)
     [key_request] = [json.loads(content) for content in platform.bodies("POST", ACCESS_KEYS)]
     assert key_request["scope"] == ["inference"]
-    assert key_request["name"].startswith(TRIAL_ACCESS_KEY_NAME_PREFIX)
-    assert key_request["expires_in_seconds"] > 0
-    [body] = [json.loads(content) for content in platform.bodies("POST", CREDENTIALS)]
-    assert body["name"] == _digest("minted-token")
+    assert key_request["name"] == f"nemo-evals-trial {CLAIMS.session}"
+    assert key_request["expires_in_seconds"] == TOKEN_LIFETIME_SEC
+    assert key_request["service_attributes"] == CLAIMS.service_attributes()
+
+
+async def test_each_attempt_at_a_trial_is_counted(platform: Platform, tmp_path: Path) -> None:
+    """Harbor retries a trial under the same name, so its attempts share a session and differ by attempt."""
+    issuer = _issuer()
+
+    attempts = [await issuer.issue(_trial_dir(tmp_path), agent_key=None) for _ in range(2)]
+    other = await issuer.issue(_trial_dir(tmp_path, "hello-world__ZyX987"), agent_key=None)
+
+    assert [issued.trial.attempt for issued in attempts if issued is not None] == [0, 1]
+    assert other is not None and other.trial.attempt == 0
 
 
 async def test_a_key_that_cannot_be_minted_leaves_the_agent_its_users_key(platform: Platform, tmp_path: Path) -> None:
     platform.answers[("POST", ACCESS_KEYS)] = httpx.Response(404, json={"detail": "Scoped Access Keys are not enabled"})
 
     assert await _issuer().issue(_trial_dir(tmp_path), agent_key="users-own-key") is None
-    assert platform.bodies("POST", CREDENTIALS) == []
 
 
-async def test_a_minted_key_that_cannot_be_recorded_is_revoked(platform: Platform, tmp_path: Path) -> None:
-    jti = "ak_" + "2" * 32
-    platform.answers[("POST", ACCESS_KEYS)] = _minted(jti=jti)
-    platform.answers[("POST", CREDENTIALS)] = httpx.Response(403, json={"detail": "Forbidden"})
-    platform.answers[("DELETE", f"{ACCESS_KEYS}/{jti}")] = httpx.Response(200, json={"jti": jti, "revoked": True})
-
-    assert await _issuer().issue(_trial_dir(tmp_path), agent_key="users-own-key") is None
-    assert len(platform.bodies("DELETE", f"{ACCESS_KEYS}/{jti}")) == 1
-
-
-async def test_a_minted_key_is_revoked_when_issuing_is_cancelled(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """Harbor's setup timeout cancels a trial; a key minted but not yet recorded must not outlive it."""
-    jti = "ak_" + "4" * 32
-    platform = Platform(
-        {
-            ("POST", ACCESS_KEYS): _minted(jti=jti),
-            ("DELETE", f"{ACCESS_KEYS}/{jti}"): httpx.Response(200, json={"jti": jti, "revoked": True}),
-        }
-    )
-    recording = asyncio.Event()
-
-    async def handler(request: httpx.Request) -> httpx.Response:
-        if request.method == "POST" and request.url.path == CREDENTIALS:
-            recording.set()
-            await asyncio.Event().wait()
-        return platform(request)
-
-    real_client = httpx.AsyncClient
-    monkeypatch.setattr(
-        trial_credentials.httpx,
-        "AsyncClient",
-        lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
-    )
-    issuing = asyncio.create_task(_issuer().issue(_trial_dir(tmp_path), agent_key="users-own-key"))
-    await recording.wait()
-
-    issuing.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await issuing
-    assert len(platform.bodies("DELETE", f"{ACCESS_KEYS}/{jti}")) == 1
+def _root_spans(platform: Platform) -> list[Span]:
+    return [
+        span
+        for export in platform.bodies("POST", OTLP)
+        for resource in ExportTraceServiceRequest.FromString(export).resource_spans
+        for scope in resource.scope_spans
+        for span in scope.spans
+    ]
 
 
-async def test_ending_a_credential_records_the_trials_root_then_revokes_its_key(platform: Platform) -> None:
+async def test_ending_a_token_records_the_trials_root_then_revokes_its_key(platform: Platform) -> None:
     jti = "ak_" + "3" * 32
-    digest = _digest("minted-token")
     platform.answers[("DELETE", f"{ACCESS_KEYS}/{jti}")] = httpx.Response(200, json={"jti": jti, "revoked": True})
-    platform.answers[("PATCH", f"{CREDENTIALS}/{digest}")] = httpx.Response(
-        200, json=_trial_json(digest, ended_at="2026-10-26T12:05:00Z", test_case_name="hello")
-    )
     platform.answers[("POST", OTLP)] = httpx.Response(200, json={})
 
-    await _issuer().end(IssuedCredential("minted-token", digest, jti))
+    await _issuer().end(IssuedCredential("minted-token", CLAIMS, jti))
 
     paths = [(request.method, request.url.path) for request in platform.seen]
-    assert paths == [("PATCH", f"{CREDENTIALS}/{digest}"), ("POST", OTLP), ("DELETE", f"{ACCESS_KEYS}/{jti}")]
-    [export] = platform.bodies("POST", OTLP)
-    request = ExportTraceServiceRequest.FromString(export)
-    [span] = request.resource_spans[0].scope_spans[0].spans
-    identity = TrialIdentity.of(RUN, TRIAL)
-    assert span.trace_id.hex() == identity.trace_id and span.span_id.hex() == identity.root_span_id
+    assert paths == [("POST", OTLP), ("DELETE", f"{ACCESS_KEYS}/{jti}")]
+    [span] = _root_spans(platform)
+    assert span.trace_id.hex() == CLAIMS.trace_id and span.span_id.hex() == CLAIMS.root_span_id
     assert not span.parent_span_id
-    assert span.end_time_unix_nano - span.start_time_unix_nano == 5 * 60 * 1_000_000_000
+
+
+async def test_the_root_span_runs_from_the_first_attempt_to_the_last(platform: Platform, tmp_path: Path) -> None:
+    """Every attempt rewrites the same root span, so each must give it the trial's first start."""
+    platform.answers[("POST", OTLP)] = httpx.Response(200, json={})
+    issuer = _issuer()
+
+    for _ in range(2):
+        issued = await issuer.issue(_trial_dir(tmp_path), agent_key=None)
+        assert issued is not None
+        await issuer.end(issued)
+
+    first, last = _root_spans(platform)
+    assert first.span_id == last.span_id
+    assert first.start_time_unix_nano == last.start_time_unix_nano
+    assert last.end_time_unix_nano > first.end_time_unix_nano
 
 
 async def test_an_unreachable_platform_never_fails_the_trial(platform: Platform, tmp_path: Path) -> None:
-    assert await _issuer().issue(_trial_dir(tmp_path), agent_key=None) is None
-    await _issuer().end(IssuedCredential("token", _digest("token"), None))
+    assert await _issuer().issue(_trial_dir(tmp_path), agent_key="users-own-key") is None
+    await _issuer().end(IssuedCredential("token", CLAIMS, "ak_" + "5" * 32))
 
 
 # --- the agent wrapper ----------------------------------------------------------------------------------
@@ -296,7 +255,7 @@ def _agent(tmp_path: Path) -> Any:
 
 
 async def test_the_agent_calls_with_its_trials_credential_from_setup_on(tmp_path: Path) -> None:
-    issued = IssuedCredential("trial-token", _digest("trial-token"), None)
+    issued = IssuedCredential(unsigned_trial_token(CLAIMS), CLAIMS, None)
     issuer = FakeIssuer(issued)
     agent, environment = _agent(tmp_path), Environment()
 
@@ -305,8 +264,8 @@ async def test_the_agent_calls_with_its_trials_credential_from_setup_on(tmp_path
         await agent.run("do it", environment, AgentContext())
 
     assert issuer.issued_for == [(TRIAL, GATEWAY_PLACEHOLDER_KEY)]
-    assert agent.saw_in_setup == agent.saw_in_run == "trial-token"
-    assert environment.overlays == [{KEY_ENV: "trial-token"}]
+    assert agent.saw_in_setup == agent.saw_in_run == issued.credential
+    assert environment.overlays == [{KEY_ENV: issued.credential}]
     assert issuer.ended == [issued]
 
 
@@ -316,7 +275,7 @@ class CrashingAgent(RecordingAgent):
 
 
 async def test_an_agent_that_fails_ends_its_credential(tmp_path: Path) -> None:
-    issued = IssuedCredential("trial-token", _digest("trial-token"), None)
+    issued = IssuedCredential(unsigned_trial_token(CLAIMS), CLAIMS, None)
     issuer = FakeIssuer(issued)
     wrapped = trial_credentials._with_trial_credential(CrashingAgent, KEY_ENV)
     agent: Any = wrapped(logs_dir=tmp_path / TRIAL / "agent", extra_env={KEY_ENV: GATEWAY_PLACEHOLDER_KEY})

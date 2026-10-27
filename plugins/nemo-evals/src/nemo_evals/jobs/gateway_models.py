@@ -24,6 +24,7 @@ from nemo_evals.jobs.secret_env import SecretEnvError
 from nemo_evals.jobs.utils import run_with_isolated_async_client
 from nemo_evals.source_authorization import SourceReadAuthorizer, authorize_source_read
 from nemo_evals.trial_recording import MIDDLEWARE_NAME
+from nemo_evals.trial_tokens import ModelAccess
 from nemo_helix_plugin.auth import platform_auth_enabled
 from nemo_helix_plugin.client.adapter import AsyncHelixClient, client_from_platform
 from nemo_helix_plugin.client.client import AsyncNemoClient, NemoClient
@@ -193,15 +194,18 @@ async def require_closed_book_route(
         ).data()
     except NotFoundError:
         virtual_model = None
-    if (
-        virtual_model is None
-        or not virtual_model.request_middleware
-        or (virtual_model.request_middleware[-1].name != CLOSED_BOOK_MIDDLEWARE)
-    ):
+    if virtual_model is None or not is_closed_book_route(virtual_model):
         raise ValueError(
             f"closed_book_required: no-network tasks {no_network} need a closed-book model route, and {model.root} "
             f"isn't one: make `{CLOSED_BOOK_MIDDLEWARE}` the last entry of its VirtualModel's request_middleware"
         )
+
+
+def is_closed_book_route(virtual_model: VirtualModel) -> bool:
+    """Whether ``virtual_model`` ends its request middleware with the closed-book middleware."""
+    return (
+        bool(virtual_model.request_middleware) and virtual_model.request_middleware[-1].name == CLOSED_BOOK_MIDDLEWARE
+    )
 
 
 def no_network_task_ids(tasks: Iterable[tuple[str, Mapping[str, Any]]]) -> list[str]:
@@ -277,8 +281,12 @@ def trial_recording_gap(virtual_model: VirtualModel) -> str | None:
     return None
 
 
-def warn_unless_trials_are_recorded(client: NemoClient | AsyncNemoClient, gateway_model: ModelRef) -> None:
-    """Log a warning when the gateway model's VirtualModel won't record the run's calls in their trials."""
+def check_trial_route(client: NemoClient | AsyncNemoClient, gateway_model: ModelRef) -> ModelAccess:
+    """The model access the gateway model's route gives trials, warning when it won't record their calls.
+
+    The route is closed-book when its VirtualModel ends its request middleware with the closed-book middleware;
+    anything else, including a VirtualModel that can't be read, is open.
+    """
     workspace, name = parse_workspace_name_ref(gateway_model.root, label="Gateway model")
 
     async def get(async_client: AsyncNemoClient) -> VirtualModel:
@@ -298,6 +306,7 @@ def warn_unless_trials_are_recorded(client: NemoClient | AsyncNemoClient, gatewa
             gateway_model.root,
             e,
         )
-        return
+        return ModelAccess.OPEN
     if (gap := trial_recording_gap(virtual_model)) is not None:
         logger.warning("Virtual model %s: %s", gateway_model.root, gap)
+    return ModelAccess.CLOSED if is_closed_book_route(virtual_model) else ModelAccess.OPEN

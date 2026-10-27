@@ -38,6 +38,7 @@ from nemo_evals.jobs.gateway_models import (
     require_closed_book_route,
 )
 from nemo_evals.jobs.secret_env import SecretEnvError
+from nemo_evals.trial_tokens import ModelAccess
 from nemo_helix_plugin.client.client import AsyncNemoClient, NemoClient
 from nemo_helix_plugin.client.errors import NotFoundError
 from nemo_helix_plugin.inference_middleware_models import MiddlewareCall, VirtualModel
@@ -541,24 +542,42 @@ def _models_client(answer: httpx.Response, *, color: str) -> NemoClient | AsyncN
     return NemoClient(base_url="http://nemo-api:8080", http_client=httpx.Client(transport=transport))
 
 
+_CLOSED_BOOK_CALL = {"name": "nemo-evals-closed-book", "config_type": "closed_book", "config": {}}
+
+
 @pytest.mark.parametrize(
-    ("virtual_model", "warning"),
+    ("virtual_model", "warning", "access"),
     [
-        pytest.param(_virtual_model([_RECORDING], [_RECORDING]), None, id="recorded"),
-        pytest.param(_virtual_model([], []), "won't be recorded in their trials", id="not listed"),
-        pytest.param(_virtual_model([_RECORDING], []), "won't be recorded in their trials", id="request only"),
+        pytest.param(_virtual_model([_RECORDING], [_RECORDING]), None, ModelAccess.OPEN, id="recorded"),
         pytest.param(
-            _virtual_model([], [_RECORDING]), "span starts when the gateway has the reply", id="response only"
+            _virtual_model([_RECORDING, _CLOSED_BOOK_CALL], [_RECORDING]), None, ModelAccess.CLOSED, id="closed-book"
         ),
-        pytest.param(None, "Couldn't read virtual model models/agent-model", id="unreadable"),
+        pytest.param(
+            _virtual_model([_CLOSED_BOOK_CALL, _RECORDING], [_RECORDING]),
+            None,
+            ModelAccess.OPEN,
+            id="closed-book not last",
+        ),
+        pytest.param(_virtual_model([], []), "won't be recorded in their trials", ModelAccess.OPEN, id="not listed"),
+        pytest.param(
+            _virtual_model([_RECORDING], []), "won't be recorded in their trials", ModelAccess.OPEN, id="request only"
+        ),
+        pytest.param(
+            _virtual_model([], [_RECORDING]),
+            "span starts when the gateway has the reply",
+            ModelAccess.OPEN,
+            id="response only",
+        ),
+        pytest.param(None, "Couldn't read virtual model models/agent-model", ModelAccess.OPEN, id="unreadable"),
     ],
 )
 @pytest.mark.parametrize("color", ["sync", "async"])
-def test_the_job_warns_when_its_virtual_model_wont_record_its_trials(
+def test_the_job_reads_its_trials_policy_from_the_route_and_warns_when_it_wont_record_them(
     caplog: pytest.LogCaptureFixture,
     monkeypatch: pytest.MonkeyPatch,
     virtual_model: dict | None,
     warning: str | None,
+    access: ModelAccess,
     color: str,
 ) -> None:
     """Recording is opt-in per virtual model, so a run that won't be attributed says so in its log."""
@@ -570,10 +589,9 @@ def test_the_job_warns_when_its_virtual_model_wont_record_its_trials(
     )
 
     with caplog.at_level("WARNING", logger=gateway_models.__name__):
-        gateway_models.warn_unless_trials_are_recorded(
-            _models_client(answer, color=color), ModelRef("models/agent-model")
-        )
+        result = gateway_models.check_trial_route(_models_client(answer, color=color), ModelRef("models/agent-model"))
 
+    assert result is access
     if warning is None:
         assert caplog.records == []
     else:

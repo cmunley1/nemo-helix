@@ -59,10 +59,10 @@ from nemo_evals.jobs.gateway_models import (
     add_gateway_key_placeholder,
     agent_gateway_origin,
     check_gateway_model,
+    check_trial_route,
     point_agent_at_gateway_model,
     rebase_registered_agent_config,
     sandbox_agent_channel,
-    warn_unless_trials_are_recorded,
 )
 from nemo_evals.jobs.gym_sandbox import (
     SandboxUnavailableError,
@@ -124,7 +124,6 @@ from nemo_helix_plugin.jobs.execution_profiles import (
     VolcanoJobExecutionProfile,
 )
 from nemo_helix_plugin.jobs.spec import BaseExecutionProfile
-from nemo_helix_plugin.models.refs import parse_workspace_name_ref
 from nhx_evals_sdk.agent_eval.evaluator import AgentEvaluator
 from nhx_evals_sdk.agent_eval.results import AgentEvalResult
 from nhx_evals_sdk.agent_eval.runtimes.fabric.runtime import FabricAgentRuntime
@@ -619,9 +618,7 @@ class _AgentEvalJobBase(NemoJob):
         if bundle_dir.exists():
             shutil.rmtree(bundle_dir)
         run_id = self._run_id() or f"agent-eval-{datetime.now(UTC):%Y%m%d%H%M%S}-{uuid.uuid4().hex[:8]}"
-        issuer = _trial_credential_issuer(spec, ctx, async_client, run_id)
-        if issuer is not None and isinstance(spec.target, HarborRunnerTarget) and spec.target.gateway_model is not None:
-            warn_unless_trials_are_recorded(platform_client, spec.target.gateway_model)
+        issuer = _trial_credential_issuer(spec, ctx, platform_client, async_client, run_id)
         run_config = AgentEvalRunConfig(
             params=params,
             prompt_template=prompt_template,
@@ -724,20 +721,23 @@ class _AgentEvalJobBase(NemoJob):
 
 
 def _trial_credential_issuer(
-    spec: AgentEvalSpec, ctx: JobContext, async_client: AsyncNemoClient | None, run_id: str
+    spec: AgentEvalSpec,
+    ctx: JobContext,
+    platform_client: NemoClient | AsyncNemoClient,
+    async_client: AsyncNemoClient | None,
+    run_id: str,
 ) -> TrialCredentialIssuer | None:
-    """The issuer of each trial's gateway credential, for a Harbor agent that calls a gateway model."""
+    """The issuer of each trial's trial token, for a Harbor agent that calls a gateway model."""
     target = spec.target
     if async_client is None or not isinstance(target, HarborRunnerTarget) or target.gateway_model is None:
         return None
-    workspace, _ = parse_workspace_name_ref(target.gateway_model.root, label="Gateway model")
     publication = spec.publication.intake if spec.publication is not None else None
     return TrialCredentialIssuer(
         async_client,
         run_id=run_id,
-        credential_workspace=workspace,
         intake_workspace=ctx.workspace,
         evaluation_name=publication.evaluation_id if publication is not None else None,
+        model_access=check_trial_route(platform_client, target.gateway_model),
     )
 
 

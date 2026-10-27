@@ -3,23 +3,18 @@
 
 """Inference Gateway middleware that records each model call an evaluation trial makes to Intake, in that trial.
 
-An evaluation job issues each trial its own credential and records which trial holds it (see
-:mod:`nemo_evals.api.v2.trial_credentials`). For every call through a VirtualModel that lists this middleware
-in ``response_middleware``, the middleware notes the caller's credential, the token usage the provider
-reported, and when the caller had the whole response. In the background it looks the credential up, by its
-SHA-256, and sends the call to Intake as a span in the trial's trace. Only credentials marked as a trial's
-(:func:`is_trial_credential`) are looked up, and a call made with a credential no trial holds is not recorded.
-Nothing here fails, delays or changes the call: a full queue drops the call, and a failed lookup or send is
-logged and dropped.
+An evaluation job issues each trial a trial token whose claims name the trial (see :mod:`nemo_evals.trial_tokens`).
+For every call through a VirtualModel that lists this middleware in ``response_middleware``, the middleware notes
+the caller's token, the token usage the provider reported, and when the caller had the whole response. In the
+background it checks who issued the token and sends the call to Intake as a span in the trial's trace. With
+platform auth on, it trusts only tokens the platform signed, whatever the gateway accepted; with auth off, only
+unsigned tokens from ``nemo-evals``. A call made with any other credential is not recorded. Nothing here fails,
+delays or changes the call: a full queue drops the call, and a failed check or send is logged and dropped.
 """
 
 from __future__ import annotations
 
 import asyncio
-import base64
-import binascii
-import hashlib
-import json
 import logging
 import time
 from collections import defaultdict
@@ -29,10 +24,10 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
 
-from nemo_evals.trial_credential_records import AsyncTrialCredentialsClient, TrialCredential
 from nemo_evals.trial_spans import call_span, export_request
+from nemo_evals.trial_tokens import TrialTokenReader, claims_a_trial
+from nemo_helix_plugin.auth import platform_auth_enabled, verified_access_key_claims
 from nemo_helix_plugin.client.client import AsyncNemoClient
-from nemo_helix_plugin.client.errors import NotFoundError
 from nemo_helix_plugin.inference_middleware import (
     InferenceMiddlewareContext,
     InferenceRequest,
@@ -49,10 +44,6 @@ MIDDLEWARE_NAME = "nemo-evals-trial-recording"
 CONFIG_TYPE = "trial_recording"
 STARTED_AT_STATE_KEY = "started_at"
 
-TRIAL_TOKEN_PREFIX = "nhx-trial-"
-TRIAL_ACCESS_KEY_NAME_PREFIX = "nemo-evals-trial "
-ACCESS_KEY_METADATA_CLAIM = "nhx_access_key"
-
 AGENT_HEADERS = ("x-claude-code-session-id", "session_id", "session-id", "x-codex-turn-metadata", "x-codex-window-id")
 AGENT_HEADER_ATTRIBUTE_PREFIX = "nemo.agent.header."
 MAX_HEADER_VALUE_LENGTH = 1024
@@ -64,12 +55,6 @@ MAX_BATCH_BYTES = 4 * 1024 * 1024
 DEFAULT_FLUSH_INTERVAL_SEC = 1.0
 DEFAULT_SHUTDOWN_FLUSH_TIMEOUT_SEC = 5.0
 FAILURE_LOG_INTERVAL_SEC = 60.0
-TRIAL_CACHE_TTL_SEC = 10.0
-
-
-def credential_record_name(credential: str) -> str:
-    """The name a credential is recorded under: ``cred-`` and its SHA-256, cut to fit an entity name."""
-    return "cred-" + hashlib.sha256(credential.encode()).hexdigest()[:58]
 
 
 def caller_credential(headers: Mapping[str, str]) -> str | None:
@@ -79,30 +64,6 @@ def caller_credential(headers: Mapping[str, str]) -> str | None:
     if scheme.lower() == "bearer" and token.strip():
         return token.strip()
     return headers.get("x-api-key", "").strip() or None
-
-
-def is_trial_credential(credential: str) -> bool:
-    """Whether ``credential`` is marked as a trial's: a trial token, or an access key named for a trial.
-
-    The marker only decides whether to look the credential up; the evals record proves which trial holds it.
-    """
-    if credential.startswith(TRIAL_TOKEN_PREFIX):
-        return True
-    name = _access_key_claims(credential).get(ACCESS_KEY_METADATA_CLAIM, {})
-    name = name.get("name") if isinstance(name, dict) else None
-    return isinstance(name, str) and name.startswith(TRIAL_ACCESS_KEY_NAME_PREFIX)
-
-
-def _access_key_claims(token: str) -> dict[str, Any]:
-    """The unverified claims of a JWT; empty for anything else. The gateway authenticated the call already."""
-    parts = token.split(".")
-    if len(parts) != 3:
-        return {}
-    try:
-        claims = json.loads(base64.urlsafe_b64decode(parts[1] + "=" * (-len(parts[1]) % 4)))
-    except (binascii.Error, UnicodeDecodeError, ValueError):
-        return {}
-    return claims if isinstance(claims, dict) else {}
 
 
 class CallApi(StrEnum):
@@ -209,10 +170,9 @@ def usage_from_payload(api: CallApi, payload: Mapping[str, Any]) -> TokenUsage |
 
 @dataclass(frozen=True)
 class FinishedCall:
-    """A call the gateway served, waiting to be attributed to the trial that holds its credential."""
+    """A call the gateway served, waiting to be attributed to the trial its token names."""
 
-    workspace: str
-    digest: str
+    token: str
     name: str
     started_at: datetime
     ended_at: datetime
@@ -220,29 +180,8 @@ class FinishedCall:
     attributes: Mapping[str, object] = field(default_factory=dict)
 
 
-TrialLookup = Callable[[str, str], Awaitable[TrialCredential | None]]
 SpanSink = Callable[[str, list[ResourceSpans]], Awaitable[int]]
 """Sends a workspace's spans to Intake and returns how many Intake rejected."""
-
-
-class TrialCache:
-    """Remembers each credential's trial, or that no trial holds it, for ``ttl_sec``."""
-
-    def __init__(self, lookup: TrialLookup, *, ttl_sec: float = TRIAL_CACHE_TTL_SEC) -> None:
-        self._lookup = lookup
-        self._ttl_sec = ttl_sec
-        self._entries: dict[tuple[str, str], tuple[float, TrialCredential | None]] = {}
-
-    async def trial(self, workspace: str, digest: str) -> TrialCredential | None:
-        key = (workspace, digest)
-        now = time.monotonic()
-        cached = self._entries.get(key)
-        if cached is not None and now - cached[0] < self._ttl_sec:
-            return cached[1]
-        trial = await self._lookup(workspace, digest)
-        self._entries = {k: v for k, v in self._entries.items() if now - v[0] < self._ttl_sec}
-        self._entries[key] = (now, trial)
-        return trial
 
 
 class CallRecorder:
@@ -250,7 +189,7 @@ class CallRecorder:
 
     def __init__(
         self,
-        trials: TrialCache,
+        trials: TrialTokenReader,
         sink: SpanSink,
         *,
         max_queued_calls: int = DEFAULT_MAX_QUEUED_CALLS,
@@ -270,7 +209,7 @@ class CallRecorder:
 
     @property
     def dropped(self) -> int:
-        """Calls dropped so far because the queue was full, a lookup failed, or Intake rejected their batch."""
+        """Calls dropped so far because the queue was full, a token couldn't be checked, or Intake rejected their batch."""
         return self._dropped
 
     def record(self, call: FinishedCall) -> None:
@@ -333,12 +272,12 @@ class CallRecorder:
 
     async def _span(self, call: FinishedCall) -> tuple[str, ResourceSpans] | None:
         try:
-            trial = await self._trials.trial(call.workspace, call.digest)
+            trial = await self._trials.trial(call.token)
         except Exception:
             self._dropped += 1
-            self._log_failure("Could not look up the trial that holds a caller's credential", exc_info=True)
+            self._log_failure("Could not check a caller's trial token", exc_info=True)
             return None
-        if trial is None or not trial.covers(call.started_at):
+        if trial is None:
             return None
         attributes = {**call.attributes, "status": "cancelled"} if call.cancelled else call.attributes
         span = call_span(
@@ -391,19 +330,6 @@ def _chunks_under(spans: list[ResourceSpans], max_bytes: int) -> list[list[Resou
     return chunks
 
 
-def trial_lookup(client: AsyncNemoClient) -> TrialLookup:
-    """Look a credential's trial up through the evals service with *client*."""
-    evals = AsyncTrialCredentialsClient.from_client(client)
-
-    async def lookup(workspace: str, digest: str) -> TrialCredential | None:
-        try:
-            return (await evals.get_trial_credential(workspace=workspace, name=digest)).data()
-        except NotFoundError:
-            return None
-
-    return lookup
-
-
 def intake_sink(client: AsyncNemoClient) -> SpanSink:
     """Send each workspace's spans to Intake's OTLP route with *client*."""
     intake = AsyncIntakeClient.from_client(client)
@@ -424,10 +350,10 @@ class TrialRecordingConfig(BaseModel):
 class _ObservedCall:
     """One call through the middleware: what it was, and the usage its response reported."""
 
-    def __init__(self, ctx: InferenceMiddlewareContext, digest: str) -> None:
+    def __init__(self, ctx: InferenceMiddlewareContext, token: str) -> None:
         request = ctx.original_request
         self.ctx = ctx
-        self.digest = digest
+        self.token = token
         self.api = CallApi.from_path(request.path)
         self.usage = TokenUsage()
         self.agent_headers = {
@@ -451,8 +377,7 @@ class _ObservedCall:
         if isinstance(model, str):
             attributes["gen_ai.request.model"] = model
         return FinishedCall(
-            workspace=self.ctx.workspace,
-            digest=self.digest,
+            token=self.token,
             name=self.api.value,
             started_at=started_at,
             ended_at=datetime.now(UTC),
@@ -462,7 +387,7 @@ class _ObservedCall:
 
 
 class TrialRecordingMiddleware(NemoInferenceMiddleware):
-    """Record each call made with a trial's credential to Intake, in the trial.
+    """Record each call made with a trial token to Intake, in the trial.
 
     It records from ``response_middleware``. Listed in ``request_middleware`` too, a call's span starts when the
     gateway received the call rather than when the response began.
@@ -482,7 +407,8 @@ class TrialRecordingMiddleware(NemoInferenceMiddleware):
 
     async def on_startup(self) -> None:
         client = self._get_platform_client("on_startup")
-        self._recorder = CallRecorder(TrialCache(trial_lookup(client)), intake_sink(client))
+        reader = TrialTokenReader(verified_access_key_claims if platform_auth_enabled() else None)
+        self._recorder = CallRecorder(reader, intake_sink(client))
         self._recorder.start()
 
     async def on_shutdown(self) -> None:
@@ -506,9 +432,9 @@ class TrialRecordingMiddleware(NemoInferenceMiddleware):
     ) -> InferenceResponse:
         recorder = self._recorder
         credential = caller_credential(ctx.original_request.headers)
-        if recorder is None or credential is None or not is_trial_credential(credential):
+        if recorder is None or credential is None or not claims_a_trial(credential):
             return response
-        call = _ObservedCall(ctx, credential_record_name(credential))
+        call = _ObservedCall(ctx, credential)
         started_at = ctx.state(MIDDLEWARE_NAME).get(STARTED_AT_STATE_KEY) or datetime.now(UTC)
         if isinstance(response.result, Mapping):
             call.observe(response.result)
