@@ -7,15 +7,19 @@ An evaluation job issues each trial its own credential and records which trial h
 :mod:`nemo_evals.api.v2.trial_credentials`). For every call through a VirtualModel that lists this middleware
 in ``response_middleware``, the middleware notes the caller's credential, the token usage the provider
 reported, and when the caller had the whole response. In the background it looks the credential up, by its
-SHA-256, and sends the call to Intake as a span in the trial's trace. A call made with a credential no trial
-holds is not recorded. Nothing here fails, delays or changes the call: a full queue drops the call, and a
-failed lookup or send is logged and dropped.
+SHA-256, and sends the call to Intake as a span in the trial's trace. Only credentials marked as a trial's
+(:func:`is_trial_credential`) are looked up, and a call made with a credential no trial holds is not recorded.
+Nothing here fails, delays or changes the call: a full queue drops the call, and a failed lookup or send is
+logged and dropped.
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import hashlib
+import json
 import logging
 import time
 from collections import defaultdict
@@ -46,6 +50,10 @@ MIDDLEWARE_NAME = "nemo-evals-trial-recording"
 CONFIG_TYPE = "trial_recording"
 STARTED_AT_STATE_KEY = "started_at"
 
+TRIAL_TOKEN_PREFIX = "nhx-trial-"
+TRIAL_ACCESS_KEY_NAME_PREFIX = "nemo-evals-trial "
+ACCESS_KEY_METADATA_CLAIM = "nhx_access_key"
+
 AGENT_HEADERS = ("x-claude-code-session-id", "session_id", "session-id", "x-codex-turn-metadata", "x-codex-window-id")
 AGENT_HEADER_ATTRIBUTE_PREFIX = "nemo.agent.header."
 MAX_HEADER_VALUE_LENGTH = 1024
@@ -72,6 +80,30 @@ def caller_credential(headers: Mapping[str, str]) -> str | None:
     if scheme.lower() == "bearer" and token.strip():
         return token.strip()
     return headers.get("x-api-key", "").strip() or None
+
+
+def is_trial_credential(credential: str) -> bool:
+    """Whether ``credential`` is marked as a trial's: a trial token, or an access key named for a trial.
+
+    The marker only decides whether to look the credential up; the evals record proves which trial holds it.
+    """
+    if credential.startswith(TRIAL_TOKEN_PREFIX):
+        return True
+    name = _access_key_claims(credential).get(ACCESS_KEY_METADATA_CLAIM, {})
+    name = name.get("name") if isinstance(name, dict) else None
+    return isinstance(name, str) and name.startswith(TRIAL_ACCESS_KEY_NAME_PREFIX)
+
+
+def _access_key_claims(token: str) -> dict[str, Any]:
+    """The unverified claims of a JWT; empty for anything else. The gateway authenticated the call already."""
+    parts = token.split(".")
+    if len(parts) != 3:
+        return {}
+    try:
+        claims = json.loads(base64.urlsafe_b64decode(parts[1] + "=" * (-len(parts[1]) % 4)))
+    except (binascii.Error, UnicodeDecodeError, ValueError):
+        return {}
+    return claims if isinstance(claims, dict) else {}
 
 
 class CallApi(StrEnum):
@@ -470,7 +502,7 @@ class TrialRecordingMiddleware(NemoInferenceMiddleware):
     ) -> InferenceResponse:
         recorder = self._recorder
         credential = caller_credential(ctx.original_request.headers)
-        if recorder is None or credential is None:
+        if recorder is None or credential is None or not is_trial_credential(credential):
             return response
         call = _ObservedCall(ctx, credential_digest(credential))
         started_at = ctx.state(MIDDLEWARE_NAME).get(STARTED_AT_STATE_KEY) or datetime.now(UTC)

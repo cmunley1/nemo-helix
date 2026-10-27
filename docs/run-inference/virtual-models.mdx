@@ -44,10 +44,11 @@ Each middleware entry names a plugin, a `config_type`, and either an inline `con
 {"name": "nemo-guardrails", "config_type": "guardrail_config", "config_id": "default/my-rails"}
 ```
 
-NeMo Helix ships three middleware plugins: `nemo-switchyard` for
+NeMo Helix ships four middleware plugins: `nemo-switchyard` for
 [routing](#route-across-models-with-switchyard), `nemo-guardrails` for
-[safety rails](#add-guardrails), and `nemo-evals-closed-book` for
-[closed-book evaluations](#keep-evaluations-closed-book). To write your own, see
+[safety rails](#add-guardrails), `nemo-evals-closed-book` for
+[closed-book evaluations](#keep-evaluations-closed-book), and `nemo-evals-trial-recording` for
+[recording evaluation trials](#record-evaluation-trials). To write your own, see
 [Virtual Model Plugins](/documentation/reference/plugin-architecture#virtual-model-plugins).
 
 ## Call a Virtual Model
@@ -346,6 +347,33 @@ The middleware covers Chat Completions,
 Responses, and Anthropic Messages requests, streaming or not. It does not cover model calls that
 another middleware makes on its own, such as the judge calls of the `nemo-switchyard`
 `llm_classifier` router.
+
+## Record Evaluation Trials
+
+An agent evaluation gives each Harbor trial that calls a gateway model its own credential. The
+`nemo-evals-trial-recording` middleware uses that credential to record each of the trial's model
+calls in Intake, as a span in the trial's trace with the token usage the provider reported. It
+doesn't change, delay or fail the call, and calls made with any other credential aren't recorded.
+
+It takes no settings. Add it to `request_middleware`, so a call's span starts when the call arrives,
+and to `response_middleware`, where each call is recorded:
+
+```bash
+nemo inference virtual-models create recorded-model \
+  --default-model-entity default/<model-entity> \
+  --request-middleware '[{"name": "nemo-evals-trial-recording", "config_type": "trial_recording", "config": {}}]' \
+  --response-middleware '[{"name": "nemo-evals-trial-recording", "config_type": "trial_recording", "config": {}}]'
+```
+
+To add recording to an existing virtual model, update it with its current middleware lists plus
+these entries. Each list you pass replaces the old one. To combine it with closed-book, put both
+entries in `request_middleware`, closed-book last.
+
+When the evaluation's gateway model doesn't list the middleware, the job logs a warning and runs
+without recording. With platform auth on, each trial calls the gateway with a Scoped Access Key
+minted for it, so [Scoped Access Keys](/documentation/access-control/deployment#scoped-access-keys)
+must be enabled. If a key can't be minted, the trial uses your key and its calls aren't recorded.
+Calls the model provider rejects aren't recorded either.
 
 ## Manage Virtual Models
 

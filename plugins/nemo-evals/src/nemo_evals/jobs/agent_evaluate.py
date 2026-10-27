@@ -62,6 +62,7 @@ from nemo_evals.jobs.gateway_models import (
     point_agent_at_gateway_model,
     rebase_registered_agent_config,
     sandbox_agent_channel,
+    warn_unless_trials_are_recorded,
 )
 from nemo_evals.jobs.gym_sandbox import (
     SandboxUnavailableError,
@@ -619,6 +620,8 @@ class _AgentEvalJobBase(NemoJob):
             shutil.rmtree(bundle_dir)
         run_id = self._run_id() or f"agent-eval-{datetime.now(UTC):%Y%m%d%H%M%S}-{uuid.uuid4().hex[:8]}"
         issuer = _trial_credential_issuer(spec, ctx, async_client, run_id)
+        if issuer is not None and isinstance(spec.target, HarborRunnerTarget) and spec.target.gateway_model is not None:
+            warn_unless_trials_are_recorded(platform_client, spec.target.gateway_model)
         run_config = AgentEvalRunConfig(
             params=params,
             prompt_template=prompt_template,

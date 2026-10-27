@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import ipaddress
+import logging
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
@@ -20,17 +21,24 @@ from nemo_evals.jobs.agent_spec import HarborRunnerTarget, RegisteredAgentSource
 from nemo_evals.jobs.gateway_agents import GATEWAY_PLACEHOLDER_KEY
 from nemo_evals.jobs.metric_resolution import HelixMetricModelResolver
 from nemo_evals.jobs.secret_env import SecretEnvError
+from nemo_evals.jobs.utils import run_with_isolated_async_client
 from nemo_evals.source_authorization import SourceReadAuthorizer, authorize_source_read
+from nemo_evals.trial_recording import MIDDLEWARE_NAME
 from nemo_helix_plugin.auth import platform_auth_enabled
 from nemo_helix_plugin.client.adapter import AsyncHelixClient, client_from_platform
-from nemo_helix_plugin.client.errors import NotFoundError
+from nemo_helix_plugin.client.client import AsyncNemoClient, NemoClient
+from nemo_helix_plugin.client.errors import NemoClientError, NotFoundError
 from nemo_helix_plugin.config import LOOPBACK_ADDRESSES
+from nemo_helix_plugin.inference_middleware_models import VirtualModel
 from nemo_helix_plugin.jobs.api_factory import EnvironmentVariable
 from nemo_helix_plugin.models.client import AsyncModelsClient
 from nemo_helix_plugin.models.refs import model_entity_route_openai_url, parse_workspace_name_ref
-from nemo_helix_plugin.virtual_models.client import AsyncVirtualModelsClient
+from nemo_helix_plugin.virtual_models.client import AsyncVirtualModelsClient, VirtualModelsClient
 from nhx_evals_sdk.agent_eval.runtimes.harbor.runtime import HarborEnvironmentConfig, HarborRuntimeConfig
+from nhx_evals_sdk.values import ModelRef
 from nhx_evals_sdk.values.common import SecretRef
+
+logger = logging.getLogger(__name__)
 
 
 async def check_gateway_model(
@@ -252,3 +260,44 @@ def agent_channel_name(host: str, agent_channel: Sequence[str]) -> str | None:
         except ValueError:
             continue
     return next((entry for entry in entries if host and entry.startswith(f"{host}.")), None)
+
+
+def trial_recording_gap(virtual_model: VirtualModel) -> str | None:
+    """Why calls through ``virtual_model`` aren't fully recorded in their trials; ``None`` when they are."""
+    if not any(call.name == MIDDLEWARE_NAME for call in virtual_model.response_middleware):
+        return (
+            f"it doesn't list {MIDDLEWARE_NAME} in response_middleware, so the run's gateway calls won't "
+            "be recorded in their trials"
+        )
+    if not any(call.name == MIDDLEWARE_NAME for call in virtual_model.request_middleware):
+        return (
+            f"it lists {MIDDLEWARE_NAME} in response_middleware but not request_middleware, so each "
+            "call's span starts when the gateway has the reply rather than when the call arrived"
+        )
+    return None
+
+
+def warn_unless_trials_are_recorded(client: NemoClient | AsyncNemoClient, gateway_model: ModelRef) -> None:
+    """Log a warning when the gateway model's VirtualModel won't record the run's calls in their trials."""
+    workspace, name = parse_workspace_name_ref(gateway_model.root, label="Gateway model")
+
+    async def get(async_client: AsyncNemoClient) -> VirtualModel:
+        models = AsyncVirtualModelsClient.from_client(async_client)
+        return (await models.get_virtual_model(workspace=workspace, name=name)).data()
+
+    try:
+        if isinstance(client, AsyncNemoClient):
+            virtual_model = run_with_isolated_async_client(client, get)
+        else:
+            virtual_model = (
+                VirtualModelsClient.from_client(client).get_virtual_model(workspace=workspace, name=name).data()
+            )
+    except NemoClientError as e:
+        logger.warning(
+            "Couldn't read virtual model %s to check that it records the run's gateway calls in their trials: %s",
+            gateway_model.root,
+            e,
+        )
+        return
+    if (gap := trial_recording_gap(virtual_model)) is not None:
+        logger.warning("Virtual model %s: %s", gateway_model.root, gap)

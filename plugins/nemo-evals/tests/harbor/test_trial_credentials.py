@@ -32,6 +32,7 @@ from nemo_evals.harbor.trial_credentials import (
 )
 from nemo_evals.intake.mapping import session_id_for
 from nemo_evals.jobs.gateway_agents import GATEWAY_PLACEHOLDER_KEY
+from nemo_evals.trial_recording import TRIAL_ACCESS_KEY_NAME_PREFIX, is_trial_credential
 from nemo_helix_plugin.client.client import AsyncNemoClient
 from nhx_evals_sdk.agent_eval.runtimes.harbor.runtime import HarborRuntimeConfig
 from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import ExportTraceServiceRequest
@@ -127,6 +128,7 @@ async def test_without_a_user_key_a_trial_gets_a_random_token(
 
     assert issued is not None and issued.access_key_jti is None
     assert issued.credential not in {GATEWAY_PLACEHOLDER_KEY, None}
+    assert is_trial_credential(issued.credential)
     [body] = [json.loads(content) for content in platform.bodies("POST", CREDENTIALS)]
     assert body["name"] == _digest(issued.credential)
     assert body["session_id"] == session_id_for(RUN, TRIAL)
@@ -162,6 +164,7 @@ async def test_with_a_user_key_a_trial_gets_its_own_inference_scoped_access_key(
     assert issued == IssuedCredential("minted-token", _digest("minted-token"), "ak_" + "1" * 32)
     [key_request] = [json.loads(content) for content in platform.bodies("POST", ACCESS_KEYS)]
     assert key_request["scope"] == ["inference"]
+    assert key_request["name"].startswith(TRIAL_ACCESS_KEY_NAME_PREFIX)
     assert key_request["expires_in_seconds"] > 0
     [body] = [json.loads(content) for content in platform.bodies("POST", CREDENTIALS)]
     assert body["name"] == _digest("minted-token")

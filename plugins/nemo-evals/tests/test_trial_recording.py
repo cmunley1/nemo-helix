@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
 import time
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
@@ -15,6 +17,8 @@ from typing import Any
 import pytest
 from nemo_evals.trial_recording import (
     MIDDLEWARE_NAME,
+    TRIAL_ACCESS_KEY_NAME_PREFIX,
+    TRIAL_TOKEN_PREFIX,
     CallApi,
     CallRecorder,
     FinishedCall,
@@ -24,6 +28,7 @@ from nemo_evals.trial_recording import (
     TrialRecordingMiddleware,
     caller_credential,
     credential_digest,
+    is_trial_credential,
     usage_from_payload,
 )
 from nemo_evals.trial_spans import GATEWAY_CALL_ATTRIBUTE, SESSION_ATTRIBUTE, TEST_CASE_ATTRIBUTE
@@ -31,7 +36,7 @@ from nemo_helix_plugin.evals.types import TrialCredential
 from nemo_helix_plugin.inference_middleware import InferenceMiddlewareContext, InferenceRequest, InferenceResponse
 from opentelemetry.proto.trace.v1.trace_pb2 import ResourceSpans, Span
 
-CREDENTIAL = "trial-token"
+CREDENTIAL = f"{TRIAL_TOKEN_PREFIX}token"
 NOW = datetime.now(UTC)
 TRIAL = TrialCredential(
     name=credential_digest(CREDENTIAL),
@@ -138,6 +143,42 @@ def test_the_credential_is_the_bearer_token_or_else_the_api_key(
     assert caller_credential(headers) == credential
 
 
+def _jwt(claims: dict[str, Any]) -> str:
+    payload = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=")
+    return f"eyJhbGciOiJSUzI1NiJ9.{payload}.c2lnbmF0dXJl"
+
+
+@pytest.mark.parametrize(
+    ("credential", "marked"),
+    [
+        pytest.param(f"{TRIAL_TOKEN_PREFIX}abc", True, id="trial token"),
+        pytest.param(
+            _jwt({"nhx_access_key": {"name": f"{TRIAL_ACCESS_KEY_NAME_PREFIX}run-1:t"}}), True, id="trial key"
+        ),
+        pytest.param(_jwt({"nhx_access_key": {"name": "my laptop"}}), False, id="another access key"),
+        pytest.param(_jwt({"sub": "user@example.com"}), False, id="a token that is no access key"),
+        pytest.param("inference-gateway-no-key", False, id="the placeholder"),
+        pytest.param("a.!!!.c", False, id="not a JWT"),
+        pytest.param("e30.WyJ4Il0.c2ln", False, id="claims that are no object"),
+    ],
+)
+def test_only_a_credential_marked_as_a_trials_is_one(credential: str, marked: bool) -> None:
+    assert is_trial_credential(credential) is marked
+
+
+async def test_a_call_with_an_unmarked_credential_is_never_looked_up() -> None:
+    """Most callers aren't trials, so the lookup in evals happens only for credentials marked as a trial's."""
+    lookup, sink = Trials(TRIAL), Sink()
+    middleware = _middleware(lookup, sink)
+
+    await _call(middleware, _ctx({"authorization": "Bearer users-own-key"}), {"usage": {"prompt_tokens": 1}})
+    assert middleware._recorder is not None
+    await middleware._recorder.flush()
+
+    assert lookup.asked == 0
+    assert sink.sent == []
+
+
 async def test_a_call_made_with_a_trials_credential_is_recorded_in_the_trial() -> None:
     lookup, sink = Trials(TRIAL), Sink()
     middleware = _middleware(lookup, sink)
@@ -165,7 +206,7 @@ async def test_a_call_made_with_a_trials_credential_is_recorded_in_the_trial() -
 @pytest.mark.parametrize(
     "headers",
     [
-        pytest.param({"authorization": "Bearer someone-elses-token"}, id="no trial holds the credential"),
+        pytest.param({"authorization": f"Bearer {TRIAL_TOKEN_PREFIX}other"}, id="no trial holds the credential"),
         pytest.param({}, id="no credential"),
     ],
 )

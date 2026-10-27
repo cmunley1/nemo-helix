@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -37,6 +38,7 @@ from nemo_evals.jobs.gateway_models import (
     require_closed_book_route,
 )
 from nemo_evals.jobs.secret_env import SecretEnvError
+from nemo_helix_plugin.client.client import AsyncNemoClient, NemoClient
 from nemo_helix_plugin.client.errors import NotFoundError
 from nemo_helix_plugin.inference_middleware_models import MiddlewareCall, VirtualModel
 from nemo_helix_plugin.job_context import JobContext, StoragePaths
@@ -518,3 +520,61 @@ async def test_the_caller_must_be_able_to_read_the_virtual_model(monkeypatch: py
 
     authorize.assert_awaited_once_with("GET", "/apis/inference-gateway/v2/workspaces/ws/virtual-models/cb-gpt")
     get.assert_not_awaited()
+
+
+_RECORDING = {"name": "nemo-evals-trial-recording", "config_type": "trial_recording", "config": {}}
+
+
+def _virtual_model(request: list[dict], response: list[dict]) -> dict:
+    return {
+        "name": "agent-model",
+        "workspace": "models",
+        "request_middleware": request,
+        "response_middleware": response,
+    }
+
+
+def _models_client(answer: httpx.Response, *, color: str) -> NemoClient | AsyncNemoClient:
+    transport = httpx.MockTransport(lambda request: answer)
+    if color == "async":
+        return AsyncNemoClient(base_url="http://nemo-api:8080", http_client=httpx.AsyncClient(transport=transport))
+    return NemoClient(base_url="http://nemo-api:8080", http_client=httpx.Client(transport=transport))
+
+
+@pytest.mark.parametrize(
+    ("virtual_model", "warning"),
+    [
+        pytest.param(_virtual_model([_RECORDING], [_RECORDING]), None, id="recorded"),
+        pytest.param(_virtual_model([], []), "won't be recorded in their trials", id="not listed"),
+        pytest.param(_virtual_model([_RECORDING], []), "won't be recorded in their trials", id="request only"),
+        pytest.param(
+            _virtual_model([], [_RECORDING]), "span starts when the gateway has the reply", id="response only"
+        ),
+        pytest.param(None, "Couldn't read virtual model models/agent-model", id="unreadable"),
+    ],
+)
+@pytest.mark.parametrize("color", ["sync", "async"])
+def test_the_job_warns_when_its_virtual_model_wont_record_its_trials(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    virtual_model: dict | None,
+    warning: str | None,
+    color: str,
+) -> None:
+    """Recording is opt-in per virtual model, so a run that won't be attributed says so in its log."""
+    monkeypatch.setattr(gateway_models, "run_with_isolated_async_client", lambda client, fn: asyncio.run(fn(client)))
+    answer = (
+        httpx.Response(200, json=virtual_model)
+        if virtual_model is not None
+        else httpx.Response(403, json={"detail": "forbidden"})
+    )
+
+    with caplog.at_level("WARNING", logger=gateway_models.__name__):
+        gateway_models.warn_unless_trials_are_recorded(
+            _models_client(answer, color=color), ModelRef("models/agent-model")
+        )
+
+    if warning is None:
+        assert caplog.records == []
+    else:
+        assert warning in caplog.text

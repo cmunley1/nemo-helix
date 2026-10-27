@@ -44,6 +44,7 @@ from nemo_evals.harbor.agent_setup_egress import (
 )
 from nemo_evals.intake.mapping import session_id_for
 from nemo_evals.jobs.gateway_agents import GATEWAY_PLACEHOLDER_KEY
+from nemo_evals.trial_recording import TRIAL_ACCESS_KEY_NAME_PREFIX, TRIAL_TOKEN_PREFIX
 from nemo_evals.trial_spans import export_request, trial_root_span
 from nemo_helix_plugin.auth.access_keys.client import AsyncAccessKeysClient
 from nemo_helix_plugin.auth.access_keys.types import AccessKeyCreateRequest
@@ -170,13 +171,13 @@ class TrialCredentialIssuer:
 
 
 def _random_credential() -> IssuedCredential:
-    credential = secrets.token_urlsafe(32)
+    credential = TRIAL_TOKEN_PREFIX + secrets.token_urlsafe(32)
     return IssuedCredential(credential, hashlib.sha256(credential.encode()).hexdigest(), None)
 
 
 async def _access_key(client: AsyncNemoClient, session_id: str) -> IssuedCredential:
     request = AccessKeyCreateRequest(
-        name=f"trial {session_id}"[:128],
+        name=f"{TRIAL_ACCESS_KEY_NAME_PREFIX}{session_id}"[:128],
         description="Inference Gateway key for one evaluation trial; revoked when the trial ends.",
         expires_in_seconds=ACCESS_KEY_LIFETIME_SEC,
         scope=[ACCESS_KEY_SCOPE],
