@@ -375,6 +375,14 @@ minted for it, so [Scoped Access Keys](/documentation/access-control/deployment#
 must be enabled. If a key can't be minted, the trial uses your key and its calls aren't recorded.
 Calls the model provider rejects aren't recorded either.
 
+With platform auth on, the middleware also needs its service principal allowed, or the platform
+refuses its lookups and Intake writes and no calls are recorded:
+
+```yaml
+auth:
+  allowed_service_principals: ["nemo-evals-trial-recording"]
+```
+
 ## Manage Virtual Models
 
 ```bash
