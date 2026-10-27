@@ -35,6 +35,7 @@ from nemo_evals.jobs.gateway_agents import GATEWAY_PLACEHOLDER_KEY
 from nemo_evals.trial_recording import TRIAL_ACCESS_KEY_NAME_PREFIX, is_trial_credential
 from nemo_helix_plugin.client.client import AsyncNemoClient
 from nhx_evals_sdk.agent_eval.runtimes.harbor.runtime import HarborRuntimeConfig
+from nhx_evals_sdk.agent_eval.runtimes.provenance import require_no_plaintext_credentials
 from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import ExportTraceServiceRequest
 
 TRIAL = "hello-world__AbC123"
@@ -43,7 +44,7 @@ KEY_ENV = "OPENAI_API_KEY"
 
 
 def _digest(credential: str) -> str:
-    return hashlib.sha256(credential.encode()).hexdigest()
+    return "cred-" + hashlib.sha256(credential.encode()).hexdigest()[:58]
 
 
 def test_a_trials_identity_is_the_session_publishing_uses_and_is_stable() -> None:
@@ -122,7 +123,7 @@ async def test_without_a_user_key_a_trial_gets_a_random_token(
     platform: Platform, tmp_path: Path, agent_key: str | None
 ) -> None:
     """Platform auth is off whenever the agent holds the placeholder: the gateway only needs a unique value."""
-    platform.answers[("POST", CREDENTIALS)] = httpx.Response(200, json=_trial_json("a" * 64))
+    platform.answers[("POST", CREDENTIALS)] = httpx.Response(200, json=_trial_json("cred-" + "a" * 58))
 
     issued = await _issuer().issue(_trial_dir(tmp_path), agent_key=agent_key)
 
@@ -315,6 +316,13 @@ def test_the_config_wraps_the_agent_and_names_its_key_variable() -> None:
     assert config.agent_import_path == TRIAL_CREDENTIAL_AGENT
     assert config.agent_kwargs == {"x": 1, INNER_AGENT_KWARG: "claude-code", CREDENTIAL_ENV_KWARG: KEY_ENV}
     assert config.agent_setup_timeout_multiplier is not None
+
+
+def test_the_wrapped_config_passes_the_runtimes_credential_check() -> None:
+    """The runtime refuses a run whose agent_kwargs look like plaintext credentials, so the wrapper's must not."""
+    config = with_trial_credentials(_config(agent_name="codex"), KEY_ENV)
+
+    require_no_plaintext_credentials(config.agent_kwargs, field="agent_kwargs", alternative="env_secrets")
 
 
 def test_the_config_wraps_an_agent_already_wrapped_for_setup_egress() -> None:

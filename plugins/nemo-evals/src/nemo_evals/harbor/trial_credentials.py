@@ -3,8 +3,8 @@
 
 """Give each Harbor trial its own credential for the Inference Gateway, so the gateway can attribute its calls.
 
-Harbor builds the agent from :data:`TRIAL_CREDENTIAL_AGENT` with the real agent in the ``trial_credential_inner``
-kwarg and the variable that holds the agent's gateway key in ``trial_credential_env``. What it gets back is an
+Harbor builds the agent from :data:`TRIAL_CREDENTIAL_AGENT` with the real agent in the ``trial_attribution_inner``
+kwarg and the variable that holds the agent's gateway key in ``trial_attribution_env``. What it gets back is an
 instance of a subclass of the real agent that, before setup, asks the job's :class:`TrialCredentialIssuer` for a
 credential and puts it in that variable, and ends the credential when the agent finishes.
 
@@ -44,7 +44,7 @@ from nemo_evals.harbor.agent_setup_egress import (
 )
 from nemo_evals.intake.mapping import session_id_for
 from nemo_evals.jobs.gateway_agents import GATEWAY_PLACEHOLDER_KEY
-from nemo_evals.trial_recording import TRIAL_ACCESS_KEY_NAME_PREFIX, TRIAL_TOKEN_PREFIX
+from nemo_evals.trial_recording import TRIAL_ACCESS_KEY_NAME_PREFIX, TRIAL_TOKEN_PREFIX, credential_record_name
 from nemo_evals.trial_spans import export_request, trial_root_span
 from nemo_helix_plugin.auth.access_keys.client import AsyncAccessKeysClient
 from nemo_helix_plugin.auth.access_keys.types import AccessKeyCreateRequest
@@ -57,8 +57,8 @@ from nhx_evals_sdk.agent_eval.runtimes.harbor.runtime import HarborRuntimeConfig
 logger = logging.getLogger(__name__)
 
 TRIAL_CREDENTIAL_AGENT = "nemo_evals.harbor.trial_credentials:TrialCredentialAgent"
-INNER_AGENT_KWARG = "trial_credential_inner"
-CREDENTIAL_ENV_KWARG = "trial_credential_env"
+INNER_AGENT_KWARG = "trial_attribution_inner"
+CREDENTIAL_ENV_KWARG = "trial_attribution_env"
 
 REQUEST_TIMEOUT_SEC = 10.0
 ACCESS_KEY_SCOPE = "inference"
@@ -172,7 +172,7 @@ class TrialCredentialIssuer:
 
 def _random_credential() -> IssuedCredential:
     credential = TRIAL_TOKEN_PREFIX + secrets.token_urlsafe(32)
-    return IssuedCredential(credential, hashlib.sha256(credential.encode()).hexdigest(), None)
+    return IssuedCredential(credential, credential_record_name(credential), None)
 
 
 async def _access_key(client: AsyncNemoClient, session_id: str) -> IssuedCredential:
@@ -183,7 +183,7 @@ async def _access_key(client: AsyncNemoClient, session_id: str) -> IssuedCredent
         scope=[ACCESS_KEY_SCOPE],
     )
     key = (await AsyncAccessKeysClient.from_client(client).create_access_key(body=request)).data()
-    return IssuedCredential(key.token, hashlib.sha256(key.token.encode()).hexdigest(), key.jti)
+    return IssuedCredential(key.token, credential_record_name(key.token), key.jti)
 
 
 def _test_case_name(trial_dir: Path) -> str | None:

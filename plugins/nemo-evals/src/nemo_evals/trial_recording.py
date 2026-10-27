@@ -68,9 +68,9 @@ FAILURE_LOG_INTERVAL_SEC = 60.0
 TRIAL_CACHE_TTL_SEC = 10.0
 
 
-def credential_digest(credential: str) -> str:
-    """The name a credential is recorded under: its SHA-256, as lowercase hex."""
-    return hashlib.sha256(credential.encode()).hexdigest()
+def credential_record_name(credential: str) -> str:
+    """The name a credential is recorded under: ``cred-`` and its SHA-256, cut to fit an entity name."""
+    return "cred-" + hashlib.sha256(credential.encode()).hexdigest()[:58]
 
 
 def caller_credential(headers: Mapping[str, str]) -> str | None:
@@ -504,7 +504,7 @@ class TrialRecordingMiddleware(NemoInferenceMiddleware):
         credential = caller_credential(ctx.original_request.headers)
         if recorder is None or credential is None or not is_trial_credential(credential):
             return response
-        call = _ObservedCall(ctx, credential_digest(credential))
+        call = _ObservedCall(ctx, credential_record_name(credential))
         started_at = ctx.state(MIDDLEWARE_NAME).get(STARTED_AT_STATE_KEY) or datetime.now(UTC)
         if isinstance(response.result, Mapping):
             call.observe(response.result)

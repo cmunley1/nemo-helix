@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import re
 import time
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
@@ -27,11 +28,12 @@ from nemo_evals.trial_recording import (
     TrialRecordingConfig,
     TrialRecordingMiddleware,
     caller_credential,
-    credential_digest,
+    credential_record_name,
     is_trial_credential,
     usage_from_payload,
 )
 from nemo_evals.trial_spans import GATEWAY_CALL_ATTRIBUTE, SESSION_ATTRIBUTE, TEST_CASE_ATTRIBUTE
+from nemo_helix_plugin.entity_naming import NAME_PATTERN
 from nemo_helix_plugin.evals.types import TrialCredential
 from nemo_helix_plugin.inference_middleware import InferenceMiddlewareContext, InferenceRequest, InferenceResponse
 from opentelemetry.proto.trace.v1.trace_pb2 import ResourceSpans, Span
@@ -39,7 +41,7 @@ from opentelemetry.proto.trace.v1.trace_pb2 import ResourceSpans, Span
 CREDENTIAL = f"{TRIAL_TOKEN_PREFIX}token"
 NOW = datetime.now(UTC)
 TRIAL = TrialCredential(
-    name=credential_digest(CREDENTIAL),
+    name=credential_record_name(CREDENTIAL),
     workspace="models",
     session_id="run-1:hello__abc",
     trace_id="0af7651916cd43dd8448eb211c80319c",
@@ -141,6 +143,15 @@ def test_the_credential_is_the_bearer_token_or_else_the_api_key(
     headers: dict[str, str], credential: str | None
 ) -> None:
     assert caller_credential(headers) == credential
+
+
+@pytest.mark.parametrize("credential", [f"{TRIAL_TOKEN_PREFIX}abc", "0" * 40, "eyJ.a.b"])
+def test_a_credential_is_recorded_under_a_valid_entity_name(credential: str) -> None:
+    """Records live in the entity store, which refuses names over 63 characters or starting with a digit."""
+    name = credential_record_name(credential)
+
+    assert re.fullmatch(NAME_PATTERN, name)
+    assert name != credential_record_name(credential + "x")
 
 
 def _jwt(claims: dict[str, Any]) -> str:

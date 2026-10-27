@@ -15,7 +15,7 @@ from nemo_evals.api.v2 import trial_credentials
 from nemo_helix_plugin.authz import PATH_RULES_ATTR, CallerKind
 from nemo_helix_plugin.entity_client import get_entity_client
 
-DIGEST = "a" * 64
+DIGEST = "cred-" + "a" * 58
 STARTED = datetime(2026, 10, 26, 12, tzinfo=UTC)
 BASE = "/v2/workspaces/models/trial-credentials"
 
@@ -42,7 +42,7 @@ def client(entity_store) -> TestClient:
     return TestClient(app)
 
 
-def test_a_recorded_credential_is_looked_up_by_its_digest(client: TestClient) -> None:
+def test_a_recorded_credential_is_looked_up_by_its_name(client: TestClient) -> None:
     created = client.post(BASE, json=_body())
     assert created.status_code == 200, created.text
 
@@ -66,12 +66,12 @@ def test_a_credential_cannot_be_rebound_to_another_trial(client: TestClient) -> 
 
 
 def test_a_credential_no_trial_holds_is_not_found(client: TestClient) -> None:
-    assert client.get(f"{BASE}/{'b' * 64}").status_code == 404
-    assert client.patch(f"{BASE}/{'b' * 64}", json={"ended_at": STARTED.isoformat()}).status_code == 404
+    assert client.get(f"{BASE}/{'cred-' + 'b' * 58}").status_code == 404
+    assert client.patch(f"{BASE}/{'cred-' + 'b' * 58}", json={"ended_at": STARTED.isoformat()}).status_code == 404
 
 
-@pytest.mark.parametrize("name", ["not-a-digest", "A" * 64])
-def test_a_credential_is_named_by_its_lowercase_sha256(client: TestClient, name: str) -> None:
+@pytest.mark.parametrize("name", ["not-a-name", "cred-" + "A" * 58, "a" * 64])
+def test_a_credential_is_named_from_its_lowercase_sha256(client: TestClient, name: str) -> None:
     assert client.post(BASE, json=_body(name=name)).status_code == 422
     assert client.get(f"{BASE}/{name}").status_code == 422
 

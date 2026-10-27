@@ -331,7 +331,7 @@ class CreateTaskImageBuildRequest(BaseModel):
     rebuild: bool = False
 
 
-_SHA256_HEX = r"^[0-9a-f]{64}$"
+_CREDENTIAL_RECORD_NAME = r"^cred-[0-9a-f]{58}$"
 _TRACE_ID_HEX = r"^[0-9a-f]{32}$"
 _SPAN_ID_HEX = r"^[0-9a-f]{16}$"
 
@@ -353,7 +353,10 @@ class CreateTrialCredentialRequest(_TrialCredentialFields):
 
     model_config = ConfigDict(extra="forbid")
 
-    name: str = Field(pattern=_SHA256_HEX, description="SHA-256 of the credential, as lowercase hex.")
+    name: str = Field(
+        pattern=_CREDENTIAL_RECORD_NAME,
+        description="`cred-` and the first 58 hex digits of the credential's SHA-256, which fits an entity name.",
+    )
 
 
 class EndTrialCredentialRequest(BaseModel):

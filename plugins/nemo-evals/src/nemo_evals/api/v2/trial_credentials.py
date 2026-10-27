@@ -3,8 +3,8 @@
 
 """Which trial each issued credential belongs to, under /apis/evals/v2/workspaces/{workspace}/trial-credentials.
 
-An evaluation job issues each trial its own credential for the Inference Gateway and records it here by its
-SHA-256. The gateway's trial-recording middleware looks the caller's credential up to attribute its calls.
+An evaluation job issues each trial its own credential for the Inference Gateway and records it here by a
+name derived from its SHA-256. The gateway's trial-recording middleware looks the caller's credential up to attribute its calls.
 """
 
 from __future__ import annotations
@@ -32,7 +32,9 @@ class TrialCredentialPerms(PermissionSet, namespace="evaluator.trial-credentials
     UPDATE = perm("Record when a trial stopped using its credential")
 
 
-CredentialDigest = Annotated[str, Path(pattern=r"^[0-9a-f]{64}$", description="SHA-256 of the credential.")]
+CredentialName = Annotated[
+    str, Path(pattern=r"^cred-[0-9a-f]{58}$", description="The credential's record name, from its SHA-256.")
+]
 
 router = APIRouter()
 
@@ -84,7 +86,7 @@ async def create_trial_credential(
 @path_rule(callers=[CallerKind.SERVICE_PRINCIPAL], permissions=[TrialCredentialPerms.UPDATE])
 async def end_trial_credential(
     workspace: str,
-    name: CredentialDigest,
+    name: CredentialName,
     body: EndTrialCredentialRequest,
     entities: NemoEntitiesClient = Depends(get_entity_client),
 ) -> TrialCredential:
@@ -111,7 +113,7 @@ async def end_trial_credential(
 @path_rule(callers=[CallerKind.SERVICE_PRINCIPAL], permissions=[TrialCredentialPerms.READ])
 async def get_trial_credential(
     workspace: str,
-    name: CredentialDigest,
+    name: CredentialName,
     entities: NemoEntitiesClient = Depends(get_entity_client),
 ) -> TrialCredential:
     """The trial a credential was issued to."""
