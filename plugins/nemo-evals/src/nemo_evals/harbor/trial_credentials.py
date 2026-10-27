@@ -44,13 +44,16 @@ from nemo_evals.harbor.agent_setup_egress import (
 )
 from nemo_evals.intake.mapping import session_id_for
 from nemo_evals.jobs.gateway_agents import GATEWAY_PLACEHOLDER_KEY
+from nemo_evals.trial_credential_records import (
+    AsyncTrialCredentialsClient,
+    CreateTrialCredentialRequest,
+    EndTrialCredentialRequest,
+)
 from nemo_evals.trial_recording import TRIAL_ACCESS_KEY_NAME_PREFIX, TRIAL_TOKEN_PREFIX, credential_record_name
 from nemo_evals.trial_spans import export_request, trial_root_span
 from nemo_helix_plugin.auth.access_keys.client import AsyncAccessKeysClient
 from nemo_helix_plugin.auth.access_keys.types import AccessKeyCreateRequest
 from nemo_helix_plugin.client.client import AsyncNemoClient
-from nemo_helix_plugin.evals.client import AsyncEvaluatorClient
-from nemo_helix_plugin.evals.types import CreateTrialCredentialRequest, EndTrialCredentialRequest
 from nemo_helix_plugin.intake.client import AsyncIntakeClient
 from nhx_evals_sdk.agent_eval.runtimes.harbor.runtime import HarborRuntimeConfig
 
@@ -133,7 +136,7 @@ class TrialCredentialIssuer:
                     evaluation_name=self._evaluation_name,
                     test_case_name=_test_case_name(trial_dir),
                 )
-                evals = AsyncEvaluatorClient.from_client(client)
+                evals = AsyncTrialCredentialsClient.from_client(client)
                 (await evals.create_trial_credential(workspace=self._credential_workspace, body=body)).data()
         except BaseException as e:
             if issued is not None and issued.access_key_jti is not None:
@@ -155,7 +158,7 @@ class TrialCredentialIssuer:
         """End the credential now: record the trial's root span, then revoke a minted key."""
         try:
             async with asyncio.timeout(REQUEST_TIMEOUT_SEC * 2), self._platform() as client:
-                evals = AsyncEvaluatorClient.from_client(client)
+                evals = AsyncTrialCredentialsClient.from_client(client)
                 trial = (
                     await evals.end_trial_credential(
                         workspace=self._credential_workspace,

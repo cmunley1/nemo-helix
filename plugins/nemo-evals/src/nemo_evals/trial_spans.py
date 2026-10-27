@@ -10,7 +10,7 @@ import os
 from collections.abc import Iterable, Mapping
 from datetime import datetime
 
-from nemo_helix_plugin.evals.types import TrialCredential
+from nemo_evals.trial_credential_records import TrialCredential
 from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import ExportTraceServiceRequest
 from opentelemetry.proto.common.v1.common_pb2 import AnyValue, ArrayValue, InstrumentationScope, KeyValue
 from opentelemetry.proto.resource.v1.resource_pb2 import Resource

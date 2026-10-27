@@ -29,11 +29,10 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
 
+from nemo_evals.trial_credential_records import AsyncTrialCredentialsClient, TrialCredential
 from nemo_evals.trial_spans import call_span, export_request
 from nemo_helix_plugin.client.client import AsyncNemoClient
 from nemo_helix_plugin.client.errors import NotFoundError
-from nemo_helix_plugin.evals.client import AsyncEvaluatorClient
-from nemo_helix_plugin.evals.types import TrialCredential
 from nemo_helix_plugin.inference_middleware import (
     InferenceMiddlewareContext,
     InferenceRequest,
@@ -394,7 +393,7 @@ def _chunks_under(spans: list[ResourceSpans], max_bytes: int) -> list[list[Resou
 
 def trial_lookup(client: AsyncNemoClient) -> TrialLookup:
     """Look a credential's trial up through the evals service with *client*."""
-    evals = AsyncEvaluatorClient.from_client(client)
+    evals = AsyncTrialCredentialsClient.from_client(client)
 
     async def lookup(workspace: str, digest: str) -> TrialCredential | None:
         try:

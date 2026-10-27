@@ -105,3 +105,11 @@ def test_only_services_may_use_the_routes() -> None:
     for route in trial_credentials.router.routes:
         rules = getattr(route, "endpoint").__dict__[PATH_RULES_ATTR]
         assert [rule.callers for rule in rules] == [[CallerKind.SERVICE_PRINCIPAL]]
+
+
+def test_the_routes_are_left_out_of_the_api_schema() -> None:
+    """Only the evaluation job and the trial-recording middleware use these records; they aren't public API."""
+    app = FastAPI()
+    app.include_router(trial_credentials.router, prefix="/v2/workspaces/{workspace}")
+
+    assert not [path for path in app.openapi()["paths"] if "trial-credentials" in path]

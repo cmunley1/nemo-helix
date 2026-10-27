@@ -3,8 +3,12 @@
 
 """Which trial each issued credential belongs to, under /apis/evals/v2/workspaces/{workspace}/trial-credentials.
 
+Service-only, and left out of the public API schema: the types and client live in
+:mod:`nemo_evals.trial_credential_records`.
+
 An evaluation job issues each trial its own credential for the Inference Gateway and records it here by a
-name derived from its SHA-256. The gateway's trial-recording middleware looks the caller's credential up to attribute its calls.
+name derived from its SHA-256. The gateway's trial-recording middleware looks the caller's credential up to
+attribute its calls.
 """
 
 from __future__ import annotations
@@ -14,6 +18,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, Path, status
 from nemo_evals.authz import scope
 from nemo_evals.entities import TrialCredentialEntity
+from nemo_evals.trial_credential_records import CreateTrialCredentialRequest, EndTrialCredentialRequest, TrialCredential
 from nemo_helix_plugin.authz import CallerKind, PermissionSet, path_rule, perm
 from nemo_helix_plugin.entity_client import (
     NemoEntitiesClient,
@@ -21,7 +26,6 @@ from nemo_helix_plugin.entity_client import (
     NemoEntityNotFoundError,
     get_entity_client,
 )
-from nemo_helix_plugin.evals.types import CreateTrialCredentialRequest, EndTrialCredentialRequest, TrialCredential
 
 
 class TrialCredentialPerms(PermissionSet, namespace="evaluator.trial-credentials"):
@@ -53,6 +57,7 @@ async def _get(entities: NemoEntitiesClient, workspace: str, name: str) -> Trial
 @router.post(
     "/trial-credentials",
     summary="Record Trial Credential",
+    include_in_schema=False,
     responses={status.HTTP_409_CONFLICT: {"description": "The credential is recorded for another trial"}},
 )
 @scope.write
@@ -76,6 +81,7 @@ async def create_trial_credential(
 @router.patch(
     "/trial-credentials/{name}",
     summary="End Trial Credential",
+    include_in_schema=False,
     responses={
         status.HTTP_404_NOT_FOUND: {"description": "No trial holds the credential"},
         status.HTTP_409_CONFLICT: {"description": "The credential already ended at another time"},
@@ -107,6 +113,7 @@ async def end_trial_credential(
 @router.get(
     "/trial-credentials/{name}",
     summary="Get Trial Credential",
+    include_in_schema=False,
     responses={status.HTTP_404_NOT_FOUND: {"description": "No trial holds the credential"}},
 )
 @scope.read

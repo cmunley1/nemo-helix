@@ -16,6 +16,7 @@ from importlib.metadata import entry_points
 from typing import Any
 
 import pytest
+from nemo_evals.trial_credential_records import TrialCredential
 from nemo_evals.trial_recording import (
     MIDDLEWARE_NAME,
     TRIAL_ACCESS_KEY_NAME_PREFIX,
@@ -34,7 +35,6 @@ from nemo_evals.trial_recording import (
 )
 from nemo_evals.trial_spans import GATEWAY_CALL_ATTRIBUTE, SESSION_ATTRIBUTE, TEST_CASE_ATTRIBUTE
 from nemo_helix_plugin.entity_naming import NAME_PATTERN
-from nemo_helix_plugin.evals.types import TrialCredential
 from nemo_helix_plugin.inference_middleware import InferenceMiddlewareContext, InferenceRequest, InferenceResponse
 from opentelemetry.proto.trace.v1.trace_pb2 import ResourceSpans, Span
 

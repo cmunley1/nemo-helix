@@ -3554,122 +3554,6 @@ paths:
           description: Taskset or revision not found
         '422':
           description: Tag is reserved
-  /apis/evals/v2/workspaces/{workspace}/trial-credentials:
-    post:
-      tags:
-      - Evals Plugin Trial Credential Routes
-      summary: Record Trial Credential
-      description: Record the trial a credential was issued to. Recording the same
-        binding again returns it.
-      operationId: create_trial_credential_apis_evals_v2_workspaces__workspace__trial_credentials_post
-      parameters:
-      - name: workspace
-        in: path
-        required: true
-        schema:
-          type: string
-          title: Workspace
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/CreateTrialCredentialRequest'
-      responses:
-        '200':
-          description: Successful Response
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/TrialCredential'
-        '409':
-          description: The credential is recorded for another trial
-        '422':
-          description: Validation Error
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/HTTPValidationError'
-  /apis/evals/v2/workspaces/{workspace}/trial-credentials/{name}:
-    patch:
-      tags:
-      - Evals Plugin Trial Credential Routes
-      summary: End Trial Credential
-      description: Stop attributing the credential's calls after ``ended_at``. Ending
-        it again at the same time returns it.
-      operationId: end_trial_credential_apis_evals_v2_workspaces__workspace__trial_credentials__name__patch
-      parameters:
-      - name: workspace
-        in: path
-        required: true
-        schema:
-          type: string
-          title: Workspace
-      - name: name
-        in: path
-        required: true
-        schema:
-          type: string
-          pattern: ^cred-[0-9a-f]{58}$
-          description: The credential's record name, from its SHA-256.
-          title: Name
-        description: The credential's record name, from its SHA-256.
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/EndTrialCredentialRequest'
-      responses:
-        '200':
-          description: Successful Response
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/TrialCredential'
-        '404':
-          description: No trial holds the credential
-        '409':
-          description: The credential already ended at another time
-        '422':
-          description: The end is before the trial was issued it
-    get:
-      tags:
-      - Evals Plugin Trial Credential Routes
-      summary: Get Trial Credential
-      description: The trial a credential was issued to.
-      operationId: get_trial_credential_apis_evals_v2_workspaces__workspace__trial_credentials__name__get
-      parameters:
-      - name: workspace
-        in: path
-        required: true
-        schema:
-          type: string
-          title: Workspace
-      - name: name
-        in: path
-        required: true
-        schema:
-          type: string
-          pattern: ^cred-[0-9a-f]{58}$
-          description: The credential's record name, from its SHA-256.
-          title: Name
-        description: The credential's record name, from its SHA-256.
-      responses:
-        '200':
-          description: Successful Response
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/TrialCredential'
-        '404':
-          description: No trial holds the credential
-        '422':
-          description: Validation Error
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/HTTPValidationError'
 components:
   schemas:
     AgentEvalInputSpec:
@@ -4865,59 +4749,6 @@ components:
         polymorphically (typed as an abstract base), which renders as an opaque
 
         object in the spec; this concrete DTO documents the actual fields.'
-    CreateTrialCredentialRequest:
-      properties:
-        session_id:
-          type: string
-          maxLength: 1024
-          minLength: 1
-          title: Session Id
-          description: The trial's Intake session.
-        trace_id:
-          type: string
-          pattern: ^[0-9a-f]{32}$
-          title: Trace Id
-          description: 'The trial''s trace id: 32 lowercase hex characters.'
-        root_span_id:
-          type: string
-          pattern: ^[0-9a-f]{16}$
-          title: Root Span Id
-          description: 'The trial''s root span id: 16 lowercase hex characters.'
-        intake_workspace:
-          type: string
-          minLength: 1
-          title: Intake Workspace
-          description: The workspace the trial's spans are recorded in.
-        started_at:
-          type: string
-          format: date-time
-          title: Started At
-          description: When the trial was issued the credential.
-        evaluation_name:
-          title: Evaluation Name
-          description: The Intake evaluation the trial belongs to.
-          type: string
-        test_case_name:
-          title: Test Case Name
-          description: The Intake test case the trial runs.
-          type: string
-        name:
-          type: string
-          pattern: ^cred-[0-9a-f]{58}$
-          title: Name
-          description: '`cred-` and the first 58 hex digits of the credential''s SHA-256,
-            which fits an entity name.'
-      additionalProperties: false
-      type: object
-      required:
-      - session_id
-      - trace_id
-      - root_span_id
-      - intake_workspace
-      - started_at
-      - name
-      title: CreateTrialCredentialRequest
-      description: Bind a credential, by its SHA-256, to the trial it was issued to.
     DatetimeFilter:
       additionalProperties: false
       properties:
@@ -4933,18 +4764,6 @@ components:
           type: string
       title: DatetimeFilter
       type: object
-    EndTrialCredentialRequest:
-      properties:
-        ended_at:
-          type: string
-          format: date-time
-          title: Ended At
-      additionalProperties: false
-      type: object
-      required:
-      - ended_at
-      title: EndTrialCredentialRequest
-      description: Stop attributing calls made with the credential after ``ended_at``.
     EnvironmentSpecInline:
       properties:
         description:
@@ -9784,67 +9603,6 @@ components:
       required:
       - data
       title: TasksetsPage
-    TrialCredential:
-      properties:
-        session_id:
-          type: string
-          maxLength: 1024
-          minLength: 1
-          title: Session Id
-          description: The trial's Intake session.
-        trace_id:
-          type: string
-          pattern: ^[0-9a-f]{32}$
-          title: Trace Id
-          description: 'The trial''s trace id: 32 lowercase hex characters.'
-        root_span_id:
-          type: string
-          pattern: ^[0-9a-f]{16}$
-          title: Root Span Id
-          description: 'The trial''s root span id: 16 lowercase hex characters.'
-        intake_workspace:
-          type: string
-          minLength: 1
-          title: Intake Workspace
-          description: The workspace the trial's spans are recorded in.
-        started_at:
-          type: string
-          format: date-time
-          title: Started At
-          description: When the trial was issued the credential.
-        evaluation_name:
-          title: Evaluation Name
-          description: The Intake evaluation the trial belongs to.
-          type: string
-        test_case_name:
-          title: Test Case Name
-          description: The Intake test case the trial runs.
-          type: string
-        name:
-          type: string
-          title: Name
-          description: '`cred-` and the first 58 hex digits of the credential''s SHA-256,
-            which fits an entity name.'
-        workspace:
-          type: string
-          title: Workspace
-        ended_at:
-          title: Ended At
-          description: When the trial stopped using the credential.
-          type: string
-          format: date-time
-      type: object
-      required:
-      - session_id
-      - trace_id
-      - root_span_id
-      - intake_workspace
-      - started_at
-      - name
-      - workspace
-      title: TrialCredential
-      description: The trial a credential was issued to; the Inference Gateway attributes
-        calls made with it to that trial.
     TrialError:
       properties:
         type:
