@@ -18,7 +18,7 @@ from harbor.trial.network_policy import resolve_agent_phase_policy
 from nemo_agents_plugin.runner.deployments_backend import resolve_agent_gateway_url, rewrite_fabric_config_base_urls
 from nemo_agents_plugin.utils import get_base_url, get_internal_base_url
 from nemo_evals.closed_book import MIDDLEWARE_NAME as CLOSED_BOOK_MIDDLEWARE
-from nemo_evals.jobs.agent_spec import HarborRunnerTarget, RegisteredAgentSource
+from nemo_evals.jobs.agent_spec import HarborRunnerTarget, RegisteredAgentSource, registered_agent_config
 from nemo_evals.jobs.gateway_agents import GATEWAY_PLACEHOLDER_KEY
 from nemo_evals.jobs.metric_resolution import HelixMetricModelResolver
 from nemo_evals.jobs.secret_env import SecretEnvError
@@ -150,21 +150,61 @@ _FABRIC_GATEWAY_ROUTE = re.compile(
 FABRIC_GATEWAY_KEY_ENV = "NEMO_AGENTS_IGW_API_KEY"
 
 
+def _fabric_base_url(model: Mapping[str, Any]) -> str:
+    """The URL a Fabric model config calls, read as the runtime reads it."""
+    settings = model.get("settings")
+    url = model.get("base_url") or (settings.get("base_url") if isinstance(settings, Mapping) else None)
+    return url if isinstance(url, str) else ""
+
+
+def _fabric_gateway_model(model: object) -> ModelRef | None:
+    """The gateway model one Fabric model config calls, or ``None`` if it doesn't call the Inference Gateway."""
+    if not isinstance(model, Mapping):
+        return None
+    match = _FABRIC_GATEWAY_ROUTE.search(_fabric_base_url(model))
+    name = (match["name"] or model.get("model")) if match is not None else None
+    if not isinstance(name, str) or not name:
+        return None
+    assert match is not None
+    return ModelRef(name if "/" in name else f"{match['workspace']}/{name}")
+
+
 def fabric_gateway_route(config: Mapping[str, Any]) -> tuple[ModelRef, str] | None:
     """The gateway model a Fabric config's default model calls, and the variable it reads its key from.
 
     ``None`` when the default model doesn't call the Inference Gateway.
     """
     model = (config.get("models") or {}).get("default")
-    if not isinstance(model, Mapping):
+    ref = _fabric_gateway_model(model)
+    if ref is None:
         return None
-    match = _FABRIC_GATEWAY_ROUTE.search(str(model.get("base_url") or ""))
-    name = (match["name"] or model.get("model")) if match is not None else None
-    if not isinstance(name, str) or not name:
-        return None
-    assert match is not None
-    ref = name if "/" in name else f"{match['workspace']}/{name}"
-    return ModelRef(ref), str(model.get("api_key_env") or FABRIC_GATEWAY_KEY_ENV)
+    assert isinstance(model, Mapping)
+    return ref, str(model.get("api_key_env") or FABRIC_GATEWAY_KEY_ENV)
+
+
+def fabric_gateway_models(config: Mapping[str, Any]) -> list[ModelRef]:
+    """Every gateway model a Fabric config's shared and harness models call, each once.
+
+    Raises:
+        ValueError: A model's URL is a template, or calls the gateway on a route that names no virtual model.
+    """
+    models = list((config.get("models") or {}).values())
+    models += [
+        harness.get("model") for harness in (config.get("harnesses") or {}).values() if isinstance(harness, Mapping)
+    ]
+    refs: list[ModelRef] = []
+    for model in models:
+        if not isinstance(model, Mapping):
+            continue
+        url = _fabric_base_url(model)
+        if "$" in url:
+            raise ValueError(f"a model's base_url {url!r} is a template, so where it calls can't be checked")
+        ref = _fabric_gateway_model(model)
+        if ref is None and urlsplit(url).path.startswith("/apis/inference-gateway/"):
+            raise ValueError(f"a model calls the gateway at {urlsplit(url).path!r}, which names no virtual model")
+        if ref is not None and ref not in refs:
+            refs.append(ref)
+    return refs
 
 
 def rebase_registered_agent_config(target: HarborRunnerTarget, agent_kwargs: dict[str, Any], origin: str) -> None:
@@ -197,14 +237,38 @@ async def require_closed_book_route(
     no_network = no_network_task_ids(tasks)
     if not no_network or (isinstance(target, HarborRunnerTarget) and target.agent_name in MODEL_FREE_HARBOR_AGENTS):
         return
-    model = target.gateway_model if isinstance(target, HarborRunnerTarget) else None
-    if model is None:
+    try:
+        models = _gateway_models(target)
+    except ValueError as exc:
+        raise ValueError(
+            f"closed_book_required: no-network tasks {no_network} need a closed-book model route: {exc}"
+        ) from exc
+    if not models:
         raise ValueError(
             f"closed_book_required: no-network tasks {no_network} need the agent's model calls to go through a "
-            f'closed-book VirtualModel: give a built-in agent one as `model: {{"ref": ...}}`'
+            f'closed-book VirtualModel: give a built-in agent one as `model: {{"ref": ...}}`, or point a registered '
+            "agent's models at one through the Inference Gateway"
         )
     if async_sdk is None:
         raise ValueError("checking a closed-book model route requires a platform client")
+    for model in models:
+        await _require_closed_book_model(model, no_network, async_sdk=async_sdk, authorize=authorize)
+
+
+def _gateway_models(target: object) -> list[ModelRef]:
+    """The gateway models an agent's calls go to: a built-in agent's one, or every one a registered agent's config names."""
+    if not isinstance(target, HarborRunnerTarget):
+        return []
+    if target.gateway_model is not None:
+        return [target.gateway_model]
+    if isinstance(target.source, RegisteredAgentSource) and (config := registered_agent_config(target)) is not None:
+        return fabric_gateway_models(config)
+    return []
+
+
+async def _require_closed_book_model(
+    model: ModelRef, no_network: list[str], *, async_sdk: AsyncHelixClient, authorize: SourceReadAuthorizer | None
+) -> None:
     workspace, name = parse_workspace_name_ref(model.root, label="Gateway model")
     await authorize_source_read(authorize, "virtual_model", workspace, name)
     try:

@@ -504,6 +504,85 @@ async def test_a_model_route_evals_cannot_check_is_refused_for_no_network_tasks(
         await require_closed_book_route(target, _NO_NETWORK_TASKS, async_sdk=None, authorize=None)
 
 
+_IGW = "http://h/apis/inference-gateway/v2/workspaces/ws"
+
+
+def _registered(config: dict[str, object]) -> HarborRunnerTarget:
+    return HarborRunnerTarget(
+        source=RegisteredAgentSource(agent=AgentRef("ws/coder")), agent_kwargs={"fabric_config": config}
+    )
+
+
+async def test_a_registered_agent_whose_gateway_models_are_closed_book_serves_no_network_tasks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every model the agent calls through the gateway is checked; one it calls elsewhere can't leave the sandbox."""
+    get = _virtual_models(monkeypatch, VirtualModel(name="cb", workspace="ws", request_middleware=[_CLOSED_BOOK]))
+    target = _registered(
+        {
+            "models": {
+                "default": {"base_url": f"{_IGW}/openai/-/v1", "model": "cb"},
+                "elsewhere": {"base_url": "https://integrate.api.nvidia.com/v1", "model": "x"},
+            },
+            "harnesses": {"codex": {"model": {"base_url": f"{_IGW}/model/cb-harness/-/v1"}}},
+        }
+    )
+
+    await require_closed_book_route(target, _NO_NETWORK_TASKS, async_sdk=AsyncMock(), authorize=None)
+
+    assert [call.kwargs["name"] for call in get.await_args_list] == ["cb", "cb-harness"]
+
+
+async def test_a_registered_agent_with_a_harness_model_that_is_not_closed_book_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    by_name = {
+        "cb": VirtualModel(name="cb", workspace="ws", request_middleware=[_CLOSED_BOOK]),
+        "open": VirtualModel(name="open", workspace="ws"),
+    }
+    get = AsyncMock(side_effect=lambda name, **_: SimpleNamespace(data=lambda: by_name[name]))
+    monkeypatch.setattr(gateway_models, "client_from_platform", lambda *_: SimpleNamespace(get_virtual_model=get))
+    target = _registered(
+        {
+            "models": {"default": {"base_url": f"{_IGW}/openai/-/v1", "model": "cb"}},
+            "harnesses": {"codex": {"model": {"base_url": f"{_IGW}/openai/-/v1", "model": "open"}}},
+        }
+    )
+
+    with pytest.raises(ValueError, match=r"ws/open isn't one"):
+        await require_closed_book_route(target, _NO_NETWORK_TASKS, async_sdk=AsyncMock(), authorize=None)
+
+
+@pytest.mark.parametrize(
+    ("model", "match"),
+    [
+        pytest.param(
+            {"settings": {"base_url": f"{_IGW}/openai/-/v1"}, "model": "open"},
+            r"ws/open isn't one",
+            id="url-in-settings",
+        ),
+        pytest.param(
+            {"base_url": f"{_IGW}/provider/stub/-/v1", "model": "x"}, r"names no virtual model", id="provider-route"
+        ),
+        pytest.param({"base_url": "${GATEWAY_URL}/v1", "model": "cb"}, r"is a template", id="templated-url"),
+    ],
+)
+async def test_a_registered_agent_model_evals_cannot_check_is_refused(
+    monkeypatch: pytest.MonkeyPatch, model: dict[str, object], match: str
+) -> None:
+    """The check reads a model's URL as the runtime does, and fails closed on a gateway route it can't resolve."""
+    by_name = {
+        "cb": VirtualModel(name="cb", workspace="ws", request_middleware=[_CLOSED_BOOK]),
+        "open": VirtualModel(name="open", workspace="ws"),
+    }
+    get = AsyncMock(side_effect=lambda name, **_: SimpleNamespace(data=lambda: by_name[name]))
+    monkeypatch.setattr(gateway_models, "client_from_platform", lambda *_: SimpleNamespace(get_virtual_model=get))
+    target = _registered({"models": {"default": {"base_url": f"{_IGW}/openai/-/v1", "model": "cb"}, "other": model}})
+
+    with pytest.raises(ValueError, match=match):
+        await require_closed_book_route(target, _NO_NETWORK_TASKS, async_sdk=AsyncMock(), authorize=None)
+
+
 @pytest.mark.parametrize("agent", ["oracle", "nop"])
 async def test_agents_that_call_no_model_run_no_network_tasks(agent: str) -> None:
     target = HarborRunnerTarget(source=HarborBuiltinAgentSource(name=agent))
