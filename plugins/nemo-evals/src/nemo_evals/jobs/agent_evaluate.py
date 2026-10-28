@@ -50,6 +50,7 @@ from nemo_evals.jobs.agent_spec import (
     ModelTarget,
     RegisteredAgentSource,
     Target,
+    registered_agent_config,
     registered_agent_files,
     validate_task_collection,
 )
@@ -59,6 +60,7 @@ from nemo_evals.jobs.gateway_models import (
     agent_gateway_origin,
     check_gateway_model,
     check_trial_route,
+    fabric_gateway_route,
     point_agent_at_gateway_model,
     rebase_registered_agent_config,
     sandbox_agent_channel,
@@ -129,7 +131,7 @@ from nhx_evals_sdk.agent_eval.runtimes.fabric.runtime import FabricAgentRuntime
 from nhx_evals_sdk.agent_eval.runtimes.harbor.runtime import HarborAgentTaskRunner, HarborRuntimeConfig
 from nhx_evals_sdk.agent_eval.tasks import AgentEvalRunConfig, AgentEvalTask
 from nhx_evals_sdk.agent_eval.trials import AgentEvalTarget
-from nhx_evals_sdk.values import RunConfigOnline, RunConfigOnlineModel
+from nhx_evals_sdk.values import ModelRef, RunConfigOnline, RunConfigOnlineModel
 from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
@@ -557,9 +559,10 @@ class _AgentEvalJobBase(NemoJob):
                 harbor_config = point_agent_at_gateway_model(
                     harbor_config.model_copy(update={"agent_kwargs": agent_kwargs}), target, origin
                 )
+            gateway = _trial_gateway(target)
             job_scope = (
-                gateway_job_scope(harbor_config, trial_issuer, target.gateway_agent_env.api_key_env)
-                if trial_issuer is not None and target.gateway_agent_env is not None
+                gateway_job_scope(harbor_config, trial_issuer, gateway[1])
+                if trial_issuer is not None and gateway is not None
                 else None
             )
             harbor_runtime = HarborAgentTaskRunner(
@@ -736,11 +739,11 @@ def _trial_credential_issuer(
     run_id: str,
 ) -> TrialCredentialIssuer | None:
     """The issuer of each trial's trial token, for a Harbor agent that calls a gateway model."""
-    target = spec.target
-    if async_client is None or not isinstance(target, HarborRunnerTarget) or target.gateway_model is None:
+    gateway = _trial_gateway(spec.target)
+    if async_client is None or gateway is None:
         return None
     publication = spec.publication.intake if spec.publication is not None else None
-    route = check_trial_route(platform_client, target.gateway_model)
+    route = check_trial_route(platform_client, gateway[0])
     return TrialCredentialIssuer(
         async_client,
         run_id=run_id,
@@ -749,6 +752,17 @@ def _trial_credential_issuer(
         model_access=route.model_access,
         records_calls=route.records_calls,
     )
+
+
+def _trial_gateway(target: Target | None) -> tuple[ModelRef, str] | None:
+    """The gateway model a Harbor target's trials call, and the variable their agent reads its key from."""
+    if not isinstance(target, HarborRunnerTarget):
+        return None
+    if target.gateway_model is not None and target.gateway_agent_env is not None:
+        return target.gateway_model, target.gateway_agent_env.api_key_env
+    if isinstance(target.source, RegisteredAgentSource) and (config := registered_agent_config(target)) is not None:
+        return fabric_gateway_route(config)
+    return None
 
 
 class AgentEvalJob(_AgentEvalJobBase):

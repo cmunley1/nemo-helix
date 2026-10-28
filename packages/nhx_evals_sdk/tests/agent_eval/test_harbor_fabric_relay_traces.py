@@ -3,12 +3,15 @@
 
 """A Fabric agent with Relay brings Relay's OTLP trace back with its Harbor trial."""
 
+import glob
 import hashlib
 import importlib.metadata
 import os
 import platform
+import socket
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from typing import Any, cast
 
@@ -18,7 +21,7 @@ pytest.importorskip("harbor", reason="NemoFabricAgent subclasses Harbor's BaseAg
 
 from harbor.environments.base import BaseEnvironment
 from nemo_fabric.integrations.harbor.fabric_agent import FabricAgent
-from nhx_evals_sdk.agent_eval.runtimes.fabric import otlp_receiver
+from nhx_evals_sdk.agent_eval.runtimes.fabric import otlp_receiver, tcp_forwarder
 from nhx_evals_sdk.agent_eval.runtimes.harbor import fabric_agent
 from nhx_evals_sdk.agent_eval.runtimes.harbor.fabric_agent import (
     RELAY_CLI_DIR,
@@ -31,6 +34,7 @@ from nhx_evals_sdk.agent_eval.runtimes.harbor.fabric_installed_agent import Fabr
 from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import ExportTraceServiceRequest
 from opentelemetry.proto.trace.v1.trace_pb2 import ResourceSpans, ScopeSpans, Span
 
+RELAY_CLI = b"#!/bin/sh\necho nemo-relay 0.10.4\n"
 RECEIVER_ENDPOINT = f"http://127.0.0.1:{RELAY_OTLP_PORT}/v1/traces"
 
 
@@ -159,7 +163,7 @@ async def test_the_receiver_listens_for_the_whole_run(
     assert f"/tmp/nemo-fabric-otlp-receiver.py {RELAY_TRACES_DIR} {RELAY_OTLP_PORT}" in start
     assert otlp_receiver.READY_FILENAME in start
     assert run == "fabric run"
-    assert stop.startswith("kill ")
+    assert "kill" in stop and "/tmp/nemo-fabric-relay-" in stop
 
 
 def test_after_the_run_the_exports_become_the_trials_otlp_trace(tmp_path: Path) -> None:
@@ -186,15 +190,16 @@ class _Context:
         return None
 
 
-def _release(tmp_path: Path, *, checksum: str | None = None) -> tuple[str, Path]:
+def _release(tmp_path: Path, *, checksum: str | None = None, binary: bytes = RELAY_CLI) -> tuple[str, Path]:
     """A local copy of a nemo-relay CLI release, laid out like GitHub's download URLs."""
     version = importlib.metadata.version("nemo-relay")
     arch = {"x86_64": "x86_64", "amd64": "x86_64", "aarch64": "aarch64", "arm64": "aarch64"}[platform.machine().lower()]
-    asset = f"nemo-relay-cli-{arch}-unknown-linux-musl-{version}"
+    libc = "musl" if glob.glob("/lib/ld-musl-*") else "gnu"
+    asset = f"nemo-relay-cli-{arch}-unknown-linux-{libc}-{version}"
     release = tmp_path / "releases" / version
     release.mkdir(parents=True)
-    (release / asset).write_bytes(b"#!/bin/sh\necho relay\n")
-    digest = checksum or hashlib.sha256(b"#!/bin/sh\necho relay\n").hexdigest()
+    (release / asset).write_bytes(binary)
+    digest = checksum or hashlib.sha256(binary).hexdigest()
     (release / f"{asset}.sha256").write_text(f"{digest}  {asset}\n")
     return (tmp_path / "releases").as_uri(), tmp_path / "bin"
 
@@ -215,7 +220,7 @@ def test_the_cli_matching_the_installed_bindings_is_installed(tmp_path: Path) ->
     result = _install(base_url, target)
 
     assert result.returncode == 0, result.stderr
-    assert (target / "nemo-relay").read_bytes() == b"#!/bin/sh\necho relay\n"
+    assert (target / "nemo-relay").read_bytes() == RELAY_CLI
     assert os.access(target / "nemo-relay", os.X_OK)
 
 
@@ -225,6 +230,18 @@ def test_a_cli_that_doesnt_match_its_checksum_is_refused(tmp_path: Path) -> None
     result = _install(base_url, target)
 
     assert result.returncode != 0 and "sha256" in result.stderr
+    assert not (target / "nemo-relay").exists()
+
+
+def test_a_cli_that_doesnt_run_in_the_image_is_refused(tmp_path: Path) -> None:
+    """A build for the wrong libc downloads fine and fails only when Fabric launches it, with a vaguer error."""
+    base_url, target = _release(tmp_path, binary=b"#!/bin/sh\necho missing loader >&2\nexit 127\n")
+
+    result = _install(base_url, target)
+
+    assert (
+        result.returncode != 0 and "does not run in this image" in result.stderr and "missing loader" in result.stderr
+    )
     assert not (target / "nemo-relay").exists()
 
 
@@ -238,3 +255,80 @@ def test_a_cli_already_on_path_is_kept(tmp_path: Path) -> None:
 
     assert result.returncode == 0, result.stderr
     assert not (tmp_path / "bin").exists()
+
+
+GATEWAY_PATH = "/apis/inference-gateway/v2/workspaces/default/openai/-/v1"
+
+
+def _gateway_agent(tmp_path: Path, base_url: str, *, relay: bool = True) -> NemoFabricAgent:
+    config = _config(relay=relay)
+    config["models"] = {"default": {"provider": "openai", "model": "default/recorded", "base_url": base_url}}
+    return NemoFabricAgent(logs_dir=tmp_path, fabric_config=config, fabric_workspace="/app")
+
+
+@pytest.mark.parametrize(
+    ("base_url", "relay", "forwarded"),
+    [
+        pytest.param(f"http://host.docker.internal:8598{GATEWAY_PATH}", True, True, id="plain HTTP gateway"),
+        pytest.param(f"https://helix.example.com{GATEWAY_PATH}", True, False, id="HTTPS gateway"),
+        pytest.param(f"http://127.0.0.1:8080{GATEWAY_PATH}", True, False, id="loopback gateway"),
+        pytest.param(f"http://host.docker.internal:8598{GATEWAY_PATH}", False, False, id="no Relay"),
+        pytest.param("http://models.example.com/v1", True, False, id="not the gateway"),
+    ],
+)
+def test_relay_reaches_a_plain_http_gateway_through_a_loopback_forwarder(
+    tmp_path: Path, base_url: str, relay: bool, forwarded: bool
+) -> None:
+    """Relay sends model credentials only over HTTPS or to loopback."""
+    agent = _gateway_agent(tmp_path, base_url, relay=relay)
+
+    model = agent._build_config().models["default"]
+
+    if forwarded:
+        assert model.base_url == f"http://127.0.0.1:14320{GATEWAY_PATH}"
+        assert agent._gateway_forwards() == {("host.docker.internal", 8598): 14320}
+    else:
+        assert model.base_url == base_url
+        assert agent._gateway_forwards() == {}
+
+
+async def test_the_forwarder_runs_beside_the_harness_for_the_whole_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def fabric_run(self: Any, instruction: str, environment: _Environment, context: Any) -> None:
+        environment.events.append("fabric run")
+
+    monkeypatch.setattr(FabricAgent, "run", fabric_run)
+    environment = _Environment()
+
+    await _gateway_agent(tmp_path, f"http://host.docker.internal:8598{GATEWAY_PATH}").run("hi", environment, None)
+
+    start, run, stop = environment.events
+    assert "/tmp/nemo-fabric-tcp-forwarder.py 14320 host.docker.internal 8598" in start
+    assert (run, "kill" in stop) == ("fabric run", True)
+
+
+def test_the_forwarder_copies_bytes_both_ways_until_each_side_closes(monkeypatch: pytest.MonkeyPatch) -> None:
+    client, client_end = socket.socketpair()
+    upstream, upstream_end = socket.socketpair()
+    monkeypatch.setattr(tcp_forwarder.socket, "create_connection", lambda address, timeout: upstream_end)
+    serving = threading.Thread(target=tcp_forwarder._serve, args=(client_end, "gateway", 8080))
+    serving.start()
+
+    client.sendall(b"POST /v1/responses HTTP/1.1\r\ntraceparent: 00-a-b-01\r\n\r\n")
+    client.shutdown(socket.SHUT_WR)
+    assert _read_all(upstream) == b"POST /v1/responses HTTP/1.1\r\ntraceparent: 00-a-b-01\r\n\r\n"
+    upstream.sendall(b"data: chunk-1\n\ndata: chunk-2\n\n")
+    upstream.close()
+
+    assert _read_all(client) == b"data: chunk-1\n\ndata: chunk-2\n\n"
+    serving.join(timeout=5)
+    assert not serving.is_alive()
+
+
+def _read_all(sock: socket.socket) -> bytes:
+    sock.settimeout(5)
+    chunks = []
+    while chunk := sock.recv(4096):
+        chunks.append(chunk)
+    return b"".join(chunks)

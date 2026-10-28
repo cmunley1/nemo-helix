@@ -351,7 +351,8 @@ another middleware makes on its own, such as the judge calls of the `nemo-switch
 ## Record Evaluation Trials
 
 An agent evaluation gives each Harbor trial that calls a gateway model its own trial token, a
-credential that names the trial. The `nemo-evals-trial-recording` middleware reads the token to
+credential that names the trial. That covers Harbor's built-in agents given a gateway model and
+registered Fabric agents whose default model goes through the gateway. The `nemo-evals-trial-recording` middleware reads the token to
 record each of the trial's model calls in Intake, as a span in the trial's trace with the token usage
 the provider reported. It doesn't change, delay or fail the
 call, and calls made with any other credential aren't recorded. With platform auth on, it trusts

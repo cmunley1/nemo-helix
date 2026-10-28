@@ -30,12 +30,14 @@ the config asks of them before a trial starts.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import re
 import shlex
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from nemo_fabric import (
     DiscoveryConfig,
@@ -51,7 +53,7 @@ from nemo_fabric import (
     inspect_adapter,
 )
 from nemo_fabric.integrations.harbor.fabric_agent import HARBOR_ARTIFACT_ROOT, FabricAgent, ensure_success
-from nhx_evals_sdk.agent_eval.runtimes.fabric import otlp_receiver
+from nhx_evals_sdk.agent_eval.runtimes.fabric import otlp_receiver, tcp_forwarder
 from nhx_evals_sdk.agent_eval.runtimes.fabric.image import fabric_version
 from nhx_evals_sdk.agent_eval.runtimes.fabric.otlp_writer import TRACES_SUBDIR, fold_exports, otlp_endpoint_fields
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -71,6 +73,13 @@ _HARBOR_EXTRA_HINT = (
     "NemoFabricAgent requires the Harbor optional dependency: install nemo-fabric[harbor] "
     "(the SDK's `harbor` extra) on Python 3.12 or later"
 )
+
+
+def _is_loopback(host: str) -> bool:
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return host.lower() == "localhost"
 
 
 def _require_harbor() -> None:
@@ -124,6 +133,11 @@ RELAY_TRACES_DIR = f"{CONTAINER_LOGS_DIR}/{TRACES_SUBDIR}"
 RELAY_OTLP_PORT = 14318
 _RECEIVER_PATH = "/tmp/nemo-fabric-otlp-receiver.py"
 _RECEIVER_PID_PATH = "/tmp/nemo-fabric-otlp-receiver.pid"
+#: Relay sends model credentials only over HTTPS or to loopback, so a plain-HTTP gateway is reached through a
+#: forwarder on loopback, one port per gateway host from this one up.
+RELAY_GATEWAY_FORWARD_PORT = 14320
+_FORWARDER_PATH = "/tmp/nemo-fabric-tcp-forwarder.py"
+_RELAY_PID_GLOB = "/tmp/nemo-fabric-relay-*.pid"
 
 #: Relay's Codex and Claude adapters launch the ``nemo-relay`` CLI, which the ``nemo-relay`` wheel
 #: doesn't ship; setup installs the release matching the installed bindings unless one is on PATH.
@@ -131,7 +145,7 @@ _RECEIVER_PID_PATH = "/tmp/nemo-fabric-otlp-receiver.pid"
 RELAY_CLI_RELEASES_URL = "https://github.com/NVIDIA/NeMo-Relay/releases/download"
 RELAY_CLI_DIR = "/tmp/nemo-relay/bin"
 _RELAY_CLI_INSTALL = """
-import hashlib, importlib.metadata, os, platform, shutil, sys, urllib.request
+import glob, hashlib, importlib.metadata, os, platform, shutil, subprocess, sys, urllib.request
 if shutil.which("nemo-relay"):
     sys.exit(0)
 try:
@@ -141,7 +155,8 @@ except importlib.metadata.PackageNotFoundError:
 arch = {"x86_64": "x86_64", "amd64": "x86_64", "aarch64": "aarch64", "arm64": "aarch64"}.get(platform.machine().lower())
 if arch is None:
     sys.exit(f"no nemo-relay CLI release for {platform.machine()}")
-asset = f"nemo-relay-cli-{arch}-unknown-linux-musl-{version}"
+libc = "musl" if glob.glob("/lib/ld-musl-*") else "gnu"
+asset = f"nemo-relay-cli-{arch}-unknown-linux-{libc}-{version}"
 url = f"{sys.argv[1]}/{version}/{asset}"
 binary = urllib.request.urlopen(url, timeout=120).read()
 expected = urllib.request.urlopen(url + ".sha256", timeout=60).read().decode().split()[0]
@@ -152,6 +167,11 @@ target = os.path.join(sys.argv[2], "nemo-relay")
 with open(target, "wb") as handle:
     handle.write(binary)
 os.chmod(target, 0o755)
+check = subprocess.run([target, "--version"], capture_output=True, text=True)
+if check.returncode != 0:
+    hint = " (a musl image needs libgcc installed)" if libc == "musl" else ""
+    os.remove(target)
+    sys.exit(f"{asset} does not run in this image{hint}: {(check.stderr or check.stdout).strip()[:500]}")
 """
 
 #: An exact ``nemo-fabric`` pin inside ``fabric_package``, with or without extras.
@@ -345,9 +365,10 @@ class NemoFabricAgent(FabricAgent):  # ty: ignore[unsupported-base]
         """Install what capturing Relay's traces needs in the container; nothing when the config has no Relay."""
         if self.fabric_config.relay is None:
             return
-        receiver = Path(self.logs_dir) / "otlp-receiver.py"
-        receiver.write_text(Path(otlp_receiver.__file__).read_text(encoding="utf-8"), encoding="utf-8")
-        await environment.upload_file(receiver, _RECEIVER_PATH)
+        for module, target in ((otlp_receiver, _RECEIVER_PATH), (tcp_forwarder, _FORWARDER_PATH)):
+            script = Path(self.logs_dir) / Path(target).name
+            script.write_text(Path(module.__file__).read_text(encoding="utf-8"), encoding="utf-8")
+            await environment.upload_file(script, target)
         result = await environment.exec(
             f"{shlex.quote(self._runner_python)} -c {shlex.quote(_RELAY_CLI_INSTALL)} "
             f"{shlex.quote(RELAY_CLI_RELEASES_URL)} {shlex.quote(RELAY_CLI_DIR)}",
@@ -360,27 +381,62 @@ class NemoFabricAgent(FabricAgent):  # ty: ignore[unsupported-base]
         if self.fabric_config.relay is None:
             await super().run(instruction, environment, context)
             return
+        python = shlex.quote(self._runner_python)
         traces = shlex.quote(RELAY_TRACES_DIR)
-        ready = shlex.quote(f"{RELAY_TRACES_DIR}/{otlp_receiver.READY_FILENAME}")
-        # Started detached, so it outlives this exec and listens while Relay exports during the run.
+        helpers = [
+            (
+                "otlp-receiver",
+                f"{shlex.quote(_RECEIVER_PATH)} {traces} {RELAY_OTLP_PORT}",
+                f"{RELAY_TRACES_DIR}/{otlp_receiver.READY_FILENAME}",
+            )
+        ]
+        for (host, port), local_port in self._gateway_forwards().items():
+            ready = f"/tmp/nemo-fabric-forwarder-{local_port}.ready"
+            helpers.append(
+                (
+                    f"forwarder-{local_port}",
+                    f"{shlex.quote(_FORWARDER_PATH)} {local_port} {shlex.quote(host)} {port} {shlex.quote(ready)}",
+                    ready,
+                )
+            )
+        # Started detached, so they outlive this exec and serve Relay for the whole run.
+        start = [f"mkdir -p {traces}"]
+        for name, arguments, ready in helpers:
+            start += [
+                f"rm -f {shlex.quote(ready)}",
+                f"nohup {python} {arguments} > {shlex.quote(f'{CONTAINER_LOGS_DIR}/{name}.log')} 2>&1 < /dev/null & "
+                f"echo $! > /tmp/nemo-fabric-relay-{name}.pid",
+            ]
+        waits = " && ".join(f"[ -f {shlex.quote(ready)} ]" for _, _, ready in helpers)
         result = await environment.exec(
-            f"mkdir -p {traces} && rm -f {ready} && "
-            f"nohup {shlex.quote(self._runner_python)} {shlex.quote(_RECEIVER_PATH)} {traces} {RELAY_OTLP_PORT} "
-            f"> {shlex.quote(f'{CONTAINER_LOGS_DIR}/otlp-receiver.log')} 2>&1 < /dev/null & "
-            f"echo $! > {shlex.quote(_RECEIVER_PID_PATH)}; "
-            f"for _ in $(seq 1 50); do [ -f {ready} ] && exit 0; sleep 0.1; done; exit 1",
+            " && ".join(start) + f"; for _ in $(seq 1 50); do {waits} && exit 0; sleep 0.1; done; exit 1",
             timeout_sec=30,
         )
-        ensure_success("The OTLP receiver for Relay's traces did not start", result)
+        ensure_success("The helpers Relay needs beside the harness did not start", result)
         try:
             await super().run(instruction, environment, context)
         finally:
-            await environment.exec(f"kill $(cat {shlex.quote(_RECEIVER_PID_PATH)}) 2>/dev/null; true", timeout_sec=30)
+            await environment.exec(
+                f"for pid in {_RELAY_PID_GLOB}; do kill $(cat $pid) 2>/dev/null; done; true", timeout_sec=30
+            )
 
     def populate_context_post_run(self, context: Any) -> None:
         super().populate_context_post_run(context)
         if self.fabric_config.relay is not None:
             fold_exports(Path(self.logs_dir) / TRACES_SUBDIR)
+
+    def _gateway_forwards(self) -> dict[tuple[str, int], int]:
+        """The loopback port forwarding to each plain-HTTP gateway host a Relay-run model calls."""
+        if self.fabric_config.relay is None:
+            return {}
+        upstreams = set()
+        for model in self.fabric_config.models.values():
+            if not model.base_url or PLATFORM_GATEWAY_PATH_MARKER not in model.base_url:
+                continue
+            url = urlsplit(model.base_url)
+            if url.scheme == "http" and url.hostname is not None and not _is_loopback(url.hostname):
+                upstreams.add((url.hostname, url.port or 80))
+        return {upstream: RELAY_GATEWAY_FORWARD_PORT + index for index, upstream in enumerate(sorted(upstreams))}
 
     @property
     def _runner_path_prefix(self) -> str | None:
@@ -419,10 +475,16 @@ class NemoFabricAgent(FabricAgent):  # ty: ignore[unsupported-base]
                 config.harness.settings.setdefault(key, value)
             for key, value in _CLAUDE_UNATTENDED_ENV.items():
                 environment.env.setdefault(key, value)
+        forwards = self._gateway_forwards()
         for model in config.models.values():
             if model.base_url and PLATFORM_GATEWAY_PATH_MARKER in model.base_url:
                 model.api_key_env = model.api_key_env or PLATFORM_GATEWAY_API_KEY_ENV
-                environment.env.setdefault(model.api_key_env, PLATFORM_GATEWAY_API_KEY_PLACEHOLDER)
+                # A key Harbor hands the agent (a trial's own gateway key) must not be shadowed by the placeholder.
+                if model.api_key_env not in self._extra_env:
+                    environment.env.setdefault(model.api_key_env, PLATFORM_GATEWAY_API_KEY_PLACEHOLDER)
+                url = urlsplit(model.base_url)
+                if (local_port := forwards.get((url.hostname or "", url.port or 80))) is not None:
+                    model.base_url = urlunsplit(url._replace(netloc=f"127.0.0.1:{local_port}"))
 
         if self.model_name:
             default = config.models.get("default")

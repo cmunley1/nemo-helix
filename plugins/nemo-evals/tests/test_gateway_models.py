@@ -35,6 +35,7 @@ from nemo_evals.jobs.gateway_models import (
     agent_gateway_origin,
     check_gateway_model,
     check_tasks_reach_the_gateway,
+    fabric_gateway_route,
     point_agent_at_gateway_model,
     require_closed_book_route,
 )
@@ -629,3 +630,37 @@ def test_the_job_reads_its_trials_policy_from_the_route_and_warns_when_it_wont_r
         assert caplog.records == []
     else:
         assert warning in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("model", "route"),
+    [
+        pytest.param(
+            {"base_url": "http://h:8080/apis/inference-gateway/v2/workspaces/dev/model/judge/-/v1"},
+            (ModelRef("dev/judge"), "NEMO_AGENTS_IGW_API_KEY"),
+            id="the model's own route",
+        ),
+        pytest.param(
+            {"base_url": "http://h/apis/inference-gateway/v2/workspaces/dev/openai/-/v1", "model": "ws/recorded"},
+            (ModelRef("ws/recorded"), "NEMO_AGENTS_IGW_API_KEY"),
+            id="the OpenAI route, model with its workspace",
+        ),
+        pytest.param(
+            {
+                "base_url": "http://h/apis/inference-gateway/v2/workspaces/dev/openai/-/v1",
+                "model": "recorded",
+                "api_key_env": "MY_KEY",
+            },
+            (ModelRef("dev/recorded"), "MY_KEY"),
+            id="the OpenAI route, bare model name",
+        ),
+        pytest.param({"base_url": "https://integrate.api.nvidia.com/v1", "model": "x"}, None, id="not the gateway"),
+        pytest.param(
+            {"base_url": "http://h/apis/inference-gateway/v2/workspaces/dev/openai/-/v1"}, None, id="no model to name"
+        ),
+    ],
+)
+def test_a_registered_agents_gateway_route_is_read_from_its_default_model(
+    model: dict[str, str], route: tuple[ModelRef, str] | None
+) -> None:
+    assert fabric_gateway_route({"models": {"default": model}}) == route

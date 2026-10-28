@@ -114,7 +114,7 @@ from nhx_evals_sdk.enums import AgentFormat
 from nhx_evals_sdk.execution.metric_execution import run_sync
 from nhx_evals_sdk.metrics.exact_match import ExactMatchMetric
 from nhx_evals_sdk.metrics.llm_judge import LLMJudgeMetric
-from nhx_evals_sdk.values import Agent, GenericAgent, Model, RunConfigOnline, RunConfigOnlineModel, SecretRef
+from nhx_evals_sdk.values import Agent, GenericAgent, Model, ModelRef, RunConfigOnline, RunConfigOnlineModel, SecretRef
 from nhx_evals_sdk.values.evidence import CandidateEvidence, EvidenceDescriptor
 from nhx_evals_sdk.values.protocol import MetricOutput
 from nhx_evals_sdk.values.scores import JSONScoreParser, RangeScore
@@ -2712,3 +2712,19 @@ def test_resolve_target_raises_a_relay_version_persisted_under_an_older_fabric(t
     assert isinstance(runner, HarborAgentTaskRunner)
     assert runner._config is not None
     assert runner._config.agent_kwargs["fabric_config"] == raised
+
+
+def test_a_registered_fabric_agent_on_the_gateway_gets_trial_tokens_in_its_models_key_variable() -> None:
+    config = {
+        "models": {
+            "default": {
+                "base_url": "http://h/apis/inference-gateway/v2/workspaces/dev/openai/-/v1",
+                "model": "dev/recorded-model",
+            }
+        }
+    }
+    target = HarborRunnerTarget(
+        source=RegisteredAgentSource(agent="dev/codex-agent"), agent_kwargs={"fabric_config": config}
+    )
+
+    assert agent_evaluate._trial_gateway(target) == (ModelRef("dev/recorded-model"), "NEMO_AGENTS_IGW_API_KEY")

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import ipaddress
 import logging
+import re
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any, NamedTuple
 from urllib.parse import urlsplit, urlunsplit
@@ -144,6 +145,31 @@ def add_gateway_key_placeholder(environment: list[EnvironmentVariable], target: 
             "use a secret under another name"
         )
     return [*environment, EnvironmentVariable(name=env.api_key_env, value=GATEWAY_PLACEHOLDER_KEY)]
+
+
+#: The gateway routes a Fabric model can name: a model's own route, or the OpenAI route with the model in the body.
+_FABRIC_GATEWAY_ROUTE = re.compile(
+    r"/apis/inference-gateway/v2/workspaces/(?P<workspace>[^/]+)/(?:model/(?P<name>[^/]+)/-|openai/-)(?:/|$)"
+)
+#: Where a registered agent reads its gateway key when its model names no ``api_key_env``.
+FABRIC_GATEWAY_KEY_ENV = "NEMO_AGENTS_IGW_API_KEY"
+
+
+def fabric_gateway_route(config: Mapping[str, Any]) -> tuple[ModelRef, str] | None:
+    """The gateway model a Fabric config's default model calls, and the variable it reads its key from.
+
+    ``None`` when the default model doesn't call the Inference Gateway.
+    """
+    model = (config.get("models") or {}).get("default")
+    if not isinstance(model, Mapping):
+        return None
+    match = _FABRIC_GATEWAY_ROUTE.search(str(model.get("base_url") or ""))
+    name = (match["name"] or model.get("model")) if match is not None else None
+    if not isinstance(name, str) or not name:
+        return None
+    assert match is not None
+    ref = name if "/" in name else f"{match['workspace']}/{name}"
+    return ModelRef(ref), str(model.get("api_key_env") or FABRIC_GATEWAY_KEY_ENV)
 
 
 def rebase_registered_agent_config(target: HarborRunnerTarget, agent_kwargs: dict[str, Any], origin: str) -> None:
