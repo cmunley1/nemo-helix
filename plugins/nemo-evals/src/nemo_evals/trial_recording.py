@@ -200,6 +200,7 @@ class CallRecorder:
         self._sink = sink
         self._queue: asyncio.Queue[FinishedCall] = asyncio.Queue(maxsize=max_queued_calls)
         self._collecting: list[FinishedCall] = []
+        self._sending: list[FinishedCall] = []
         self._max_batch_size = max_batch_size
         self._flush_interval_sec = flush_interval_sec
         self._task: asyncio.Task[None] | None = None
@@ -225,13 +226,21 @@ class CallRecorder:
             self._task = asyncio.create_task(self._run(), name="nemo-evals-trial-recorder")
 
     async def stop(self, timeout_sec: float = DEFAULT_SHUTDOWN_FLUSH_TIMEOUT_SEC) -> None:
-        """Stop the sender, then send what is still queued; the whole stop takes at most *timeout_sec*."""
+        """Stop the sender, then send what is still queued; the whole stop takes at most *timeout_sec*.
+
+        A batch the sender is already delivering gets the time to finish; one it can't finish counts as dropped.
+        """
         deadline = time.monotonic() + timeout_sec
         self._stopping = True
         if self._task is not None:
             task, self._task = self._task, None
-            task.cancel()
+            if not self._sending:
+                task.cancel()
             await asyncio.wait({task}, timeout=timeout_sec)
+            if not task.done():
+                self._dropped += len(self._sending)
+                logger.warning("Dropped %d trial calls being sent at shutdown", len(self._sending))
+                task.cancel()
         try:
             await asyncio.wait_for(self.flush(), timeout=max(0.0, deadline - time.monotonic()))
         except TimeoutError:
@@ -261,8 +270,11 @@ class CallRecorder:
                 self._collecting.append(await asyncio.wait_for(self._queue.get(), timeout=remaining))
             except TimeoutError:
                 break
-        batch, self._collecting = self._collecting, []
-        await self._send(batch)
+        self._sending, self._collecting = self._collecting, []
+        try:
+            await self._send(self._sending)
+        finally:
+            self._sending = []
 
     def _take_batch(self) -> list[FinishedCall]:
         batch: list[FinishedCall] = []

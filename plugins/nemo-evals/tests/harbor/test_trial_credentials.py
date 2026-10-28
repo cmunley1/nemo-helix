@@ -16,7 +16,7 @@ import pytest
 from harbor.job import DatasetConfig, Job, JobConfig
 from harbor.models.job.config import RetryConfig
 from harbor.models.trial.config import AgentConfig, TrialConfig
-from harbor.models.trial.result import ExceptionInfo, TrialResult
+from harbor.models.trial.result import ExceptionInfo, StepResult, TrialResult
 from harbor.trial.hooks import TrialEvent, TrialHookEvent
 from nemo_evals.harbor import trial_credentials
 from nemo_evals.harbor.trial_credentials import TrialCredentialIssuer, gateway_job_scope
@@ -166,7 +166,9 @@ class Hooks:
         monkeypatch.setattr(job, "on_trial_ended", self.ended.append)
         monkeypatch.setattr(job, "on_trial_cancelled", self.cancelled.append)
 
-    async def end(self, config: TrialConfig, *, error: str | None = None, minutes: int = 1) -> None:
+    async def end(
+        self, config: TrialConfig, *, error: str | None = None, minutes: int = 1, steps: list[StepResult] | None = None
+    ) -> None:
         exception_info = (
             None
             if error is None
@@ -176,6 +178,7 @@ class Hooks:
             started_at=STARTED.replace(minute=minutes - 1),
             finished_at=STARTED.replace(minute=minutes),
             exception_info=exception_info,
+            step_results=steps,
         )
         for hook in self.ended:
             await hook(_event(TrialEvent.END, config, result))
@@ -310,6 +313,22 @@ async def test_an_error_harbor_doesnt_retry_ends_the_trial(auth_on: Platform, jo
         await hooks.end(first, error="AgentTimeoutError")
         assert auth_on.revoked() == [_jti(0)]
         assert auth_on.root_span_failures() == [True]
+
+
+async def test_a_multi_step_trial_whose_step_failed_has_a_failed_root(
+    platform: Platform, job: Job, hooks: Hooks
+) -> None:
+    first, _ = job._remaining_trial_configs
+    step = StepResult.model_construct(
+        exception_info=ExceptionInfo(
+            exception_type="AgentTimeoutError", exception_message="", exception_traceback="", occurred_at=STARTED
+        )
+    )
+
+    async with _issuer().job_scope(KEY_ENV)(job):
+        await hooks.end(first, steps=[step])
+
+    assert platform.root_span_failures() == [True]
 
 
 async def test_a_cancelled_trial_has_its_key_revoked_and_is_still_recorded(

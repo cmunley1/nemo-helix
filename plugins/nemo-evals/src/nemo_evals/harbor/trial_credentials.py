@@ -21,6 +21,7 @@ import httpx
 from harbor.job import Job
 from harbor.models.task.task import Task
 from harbor.models.trial.config import TrialConfig
+from harbor.models.trial.result import TrialResult
 from harbor.trial.hooks import TrialHookEvent
 from nemo_evals.intake.mapping import session_id_for
 from nemo_evals.trial_spans import export_request, trial_root_span
@@ -151,7 +152,7 @@ class _JobTrials:
             trial,
             started_at,
             event.result.finished_at or datetime.now(UTC),
-            failed=event.result.exception_info is not None,
+            failed=_failed(event.result),
         )
         if name in self._cancelled or not self._will_retry(event):
             await self._revoke(name)
@@ -199,6 +200,13 @@ class _JobTrials:
             logger.warning("Could not revoke a trial's access key %s", jti, exc_info=True)
             return
         self._live_keys.pop(name, None)
+
+
+def _failed(result: TrialResult) -> bool:
+    """Whether the attempt raised; a multi-step trial records the exception on the step that raised it."""
+    return result.exception_info is not None or any(
+        step.exception_info is not None for step in result.step_results or ()
+    )
 
 
 def _test_case_name(config: TrialConfig) -> str | None:

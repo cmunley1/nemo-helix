@@ -437,6 +437,48 @@ async def test_stopping_sends_the_calls_the_sender_was_still_collecting() -> Non
     assert sorted(span.name for _, span in _spans(sink.sent)) == ["1", "2"]
 
 
+async def test_stopping_lets_a_batch_already_being_sent_finish() -> None:
+    sent = asyncio.Event()
+    entered = asyncio.Event()
+    delivered: list[str] = []
+
+    async def slow_sink(workspace: str, spans: list[ResourceSpans]) -> int:
+        entered.set()
+        await asyncio.sleep(0.05)
+        delivered.extend(span.scope_spans[0].spans[0].name for span in spans)
+        sent.set()
+        return 0
+
+    recorder = CallRecorder(_reader(TOKEN), slow_sink, flush_interval_sec=0.01)
+    recorder.start()
+    recorder.record(_finished(name="1"))
+    await entered.wait()
+
+    await recorder.stop()
+
+    assert delivered == ["1"]
+    assert recorder.dropped == 0
+
+
+async def test_a_batch_that_cant_be_sent_before_shutdown_counts_as_dropped() -> None:
+    entered = asyncio.Event()
+
+    async def hanging_sink(workspace: str, spans: list[ResourceSpans]) -> int:
+        entered.set()
+        await asyncio.Event().wait()
+        return 0
+
+    recorder = CallRecorder(_reader(TOKEN), hanging_sink, flush_interval_sec=0.01)
+    recorder.start()
+    recorder.record(_finished())
+    recorder.record(_finished())
+    await entered.wait()
+
+    await recorder.stop(timeout_sec=0.05)
+
+    assert recorder.dropped == 2
+
+
 async def test_a_batch_is_split_to_fit_intakes_body_limit(monkeypatch: pytest.MonkeyPatch) -> None:
     sink = Sink()
     recorder = CallRecorder(_reader(TOKEN), sink, flush_interval_sec=60)
