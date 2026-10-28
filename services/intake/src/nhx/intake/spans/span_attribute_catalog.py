@@ -66,6 +66,8 @@ class AttributeSpec:
     source_keys: tuple[str, ...]
     bag_aliases: tuple[str, ...] = ()
     scale: int | None = None
+    # Source keys that report a different fact rather than an alias: kept as attributes when their value differs.
+    distinct_source_keys: tuple[str, ...] = ()
 
 
 # Cost is stored as scaled integer micros to preserve fractional precision through ClickHouse Map(Float64).
@@ -84,6 +86,7 @@ ATTRIBUTE_SPECS = (
             "gen_ai.response.model",
             "llm.model_name",
         ),
+        distinct_source_keys=("gen_ai.response.model",),
     ),
     AttributeSpec(
         field=SpanAttributeField.PROVIDER,
