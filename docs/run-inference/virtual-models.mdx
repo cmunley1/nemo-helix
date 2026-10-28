@@ -354,7 +354,9 @@ An agent evaluation gives each Harbor trial that calls a gateway model its own t
 credential that names the trial. That covers Harbor's built-in agents given a gateway model and
 registered Fabric agents whose default model goes through the gateway. The `nemo-evals-trial-recording` middleware reads the token to
 record each of the trial's model calls in Intake, as a span in the trial's trace with the token usage
-the provider reported. It doesn't change, delay or fail the
+the provider reported. The span names the model the call asked for (`gen_ai.request.model`) and the
+model the response says served it (`gen_ai.response.model`), which differ when a routing provider
+picks the model. It doesn't change, delay or fail the
 call, and calls made with any other credential aren't recorded. With platform auth on, it trusts
 only trial tokens the platform signed.
 

@@ -23,6 +23,7 @@ from nemo_evals.trial_recording import (
     TrialRecordingConfig,
     TrialRecordingMiddleware,
     caller_credential,
+    model_from_payload,
     usage_from_payload,
 )
 from nemo_evals.trial_spans import (
@@ -288,7 +289,10 @@ async def test_a_streamed_call_is_recorded_with_its_usage_once_the_caller_has_it
     sink = Sink()
     middleware = _middleware(_reader(TOKEN), sink)
     chunks = [
-        {"type": "message_start", "message": {"usage": {"input_tokens": 10, "cache_read_input_tokens": 30}}},
+        {
+            "type": "message_start",
+            "message": {"model": "routed-target", "usage": {"input_tokens": 10, "cache_read_input_tokens": 30}},
+        },
         {"type": "message_delta", "usage": {"output_tokens": 15}},
     ]
 
@@ -303,6 +307,7 @@ async def test_a_streamed_call_is_recorded_with_its_usage_once_the_caller_has_it
     assert span.name == "messages"
     assert attributes["gen_ai.usage.input_tokens"] == 40
     assert attributes["gen_ai.usage.output_tokens"] == 15
+    assert attributes["gen_ai.response.model"] == "routed-target"
     assert "status" not in attributes
 
 
@@ -441,6 +446,30 @@ def test_usage_is_read_from_every_api_and_stream_shape(
         if (reported := usage_from_payload(api, payload)) is not None:
             usage.merge(reported)
     assert usage == expected
+
+
+@pytest.mark.parametrize(
+    "payloads",
+    [
+        pytest.param([{"model": "served", "choices": []}], id="body"),
+        pytest.param([{"model": "served", "choices": [{"delta": {}}]}, {"choices": [], "usage": {}}], id="chat-stream"),
+        pytest.param(
+            [
+                {"type": "response.created", "response": {"model": "served"}},
+                {"type": "response.output_text.delta", "delta": "Hi"},
+            ],
+            id="responses-stream",
+        ),
+        pytest.param(
+            [{"type": "message_start", "message": {"model": "served"}}, {"type": "message_delta", "usage": {}}],
+            id="messages-stream",
+        ),
+    ],
+)
+def test_the_served_model_is_read_from_every_api_and_stream_shape(payloads: list[dict[str, Any]]) -> None:
+    """A routing provider answers with the model it picked, which can differ from the one the caller asked for."""
+    models = [model for payload in payloads if (model := model_from_payload(payload)) is not None]
+    assert models == ["served"]
 
 
 def test_input_total_counts_every_class_once() -> None:

@@ -168,6 +168,16 @@ def usage_from_payload(api: CallApi, payload: Mapping[str, Any]) -> TokenUsage |
     )
 
 
+def model_from_payload(payload: Mapping[str, Any]) -> str | None:
+    """The model a response body or stream chunk says served the call, or ``None`` if it names none."""
+    for envelope in ("response", "message"):
+        if isinstance(payload.get(envelope), Mapping):
+            payload = payload[envelope]
+            break
+    model = payload.get("model")
+    return model if isinstance(model, str) and model else None
+
+
 @dataclass(frozen=True)
 class FinishedCall:
     """A call the gateway served, waiting to be attributed to the trial its token names."""
@@ -376,14 +386,18 @@ class _ObservedCall:
         self.token = token
         self.api = CallApi.from_path(request.path)
         self.usage = TokenUsage()
+        self.response_model: str | None = None
         self.agent_headers = {
             name: value[:MAX_HEADER_VALUE_LENGTH] for name in AGENT_HEADERS if (value := request.headers.get(name))
         }
         self.caller = CallerSpan.from_headers(request.headers.get("traceparent"), request.headers.get("tracestate"))
 
     def observe(self, payload: object) -> None:
-        if isinstance(payload, Mapping) and (usage := usage_from_payload(self.api, payload)) is not None:
+        if not isinstance(payload, Mapping):
+            return
+        if (usage := usage_from_payload(self.api, payload)) is not None:
             self.usage.merge(usage)
+        self.response_model = model_from_payload(payload) or self.response_model
 
     def finished(self, started_at: datetime, *, cancelled: bool) -> FinishedCall:
         proxied = self.ctx.proxied_request
@@ -397,6 +411,8 @@ class _ObservedCall:
         }
         if isinstance(model, str):
             attributes["gen_ai.request.model"] = model
+        if self.response_model is not None:
+            attributes["gen_ai.response.model"] = self.response_model
         return FinishedCall(
             token=self.token,
             name=self.api.value,
