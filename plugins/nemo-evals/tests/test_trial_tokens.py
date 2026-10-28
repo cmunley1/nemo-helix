@@ -105,7 +105,14 @@ def test_an_unsigned_trial_token_comes_from_nemo_evals_and_lives_a_day() -> None
     assert claims_a_trial(token)
 
 
-@pytest.mark.parametrize("token", ["users-own-key", "a.b.c", generate_unsigned_jwt("alice@example.com")])
+@pytest.mark.parametrize(
+    "token",
+    [
+        pytest.param("users-own-key", id="not a JWT"),
+        pytest.param("a.b.c", id="a malformed JWT"),
+        pytest.param(generate_unsigned_jwt("alice@example.com"), id="a user's token"),
+    ],
+)
 def test_a_token_that_names_no_trial_doesnt_claim_one(token: str) -> None:
     assert not claims_a_trial(token)
 
