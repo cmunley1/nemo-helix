@@ -15,7 +15,7 @@ import pytest
 from harbor.agents.model_connection import ModelConnectionSpec, ProviderAccess
 from nemo_agents_plugin.runner.deployments_backend import UnreachableGatewayURLError
 from nemo_evals.api.fields import AgentRef
-from nemo_evals.harbor.trial_credentials import CREDENTIAL_ENV_KWARG, INNER_AGENT_KWARG, TRIAL_CREDENTIAL_AGENT
+from nemo_evals.harbor.trial_credentials import TrialCredentialIssuer
 from nemo_evals.jobs import agent_compiler, gateway_agents, gateway_models
 from nemo_evals.jobs.agent_evaluate import AgentEvalJob
 from nemo_evals.jobs.agent_spec import (
@@ -45,7 +45,11 @@ from nemo_helix_plugin.inference_middleware_models import MiddlewareCall, Virtua
 from nemo_helix_plugin.job_context import JobContext, StoragePaths
 from nemo_helix_plugin.job_results import LocalJobResults
 from nemo_helix_plugin.jobs.api_factory import EnvironmentVariable, EnvironmentVariableFromSecret
-from nhx_evals_sdk.agent_eval.runtimes.harbor.runtime import HarborEnvironmentConfig, HarborRuntimeConfig
+from nhx_evals_sdk.agent_eval.runtimes.harbor.runtime import (
+    HarborAgentTaskRunner,
+    HarborEnvironmentConfig,
+    HarborRuntimeConfig,
+)
 from nhx_evals_sdk.values import Model, ModelRef, SecretRef
 from pydantic import ValidationError
 from pytest_mock import MockerFixture
@@ -280,7 +284,13 @@ async def test_check_ignores_targets_without_a_gateway_model(mocker: MockerFixtu
     resolve.assert_not_awaited()
 
 
-def _job_config(tmp_path: Path, target: HarborRunnerTarget, *, sandboxed: bool) -> HarborRuntimeConfig:
+def _runtime(
+    tmp_path: Path,
+    target: HarborRunnerTarget,
+    *,
+    sandboxed: bool,
+    trial_issuer: TrialCredentialIssuer | None = None,
+) -> HarborAgentTaskRunner:
     storage = StoragePaths(ephemeral=tmp_path / "ephemeral", persistent=tmp_path / "persistent")
     storage.ephemeral.mkdir()
     storage.persistent.mkdir()
@@ -292,8 +302,15 @@ def _job_config(tmp_path: Path, target: HarborRunnerTarget, *, sandboxed: bool) 
         )
         return config.model_copy(update={"environment": environment})
 
-    runtime, _, _ = AgentEvalJob._resolve_target(target, ctx, configure_harbor=to_sandbox if sandboxed else None)
-    config = getattr(runtime, "_config")
+    runtime, _, _ = AgentEvalJob._resolve_target(
+        target, ctx, configure_harbor=to_sandbox if sandboxed else None, trial_issuer=trial_issuer
+    )
+    assert isinstance(runtime, HarborAgentTaskRunner)
+    return runtime
+
+
+def _job_config(tmp_path: Path, target: HarborRunnerTarget, *, sandboxed: bool) -> HarborRuntimeConfig:
+    config = getattr(_runtime(tmp_path, target, sandboxed=sandboxed), "_config")
     assert isinstance(config, HarborRuntimeConfig)
     return config
 
@@ -319,14 +336,14 @@ def test_the_job_points_the_agent_at_the_route_for_its_environment(
 def test_the_job_gives_each_trial_its_own_gateway_credential(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sandboxed: bool
 ) -> None:
-    """The agent is wrapped so each trial's calls carry a credential the gateway can attribute to it."""
+    """The runner hands each planned job to the issuer, and runs the agent the user chose."""
     monkeypatch.setenv("NHX_INTERNAL_BASE_URL", "http://nemo-api.ns.svc:8080")
+    issuer = TrialCredentialIssuer(AsyncNemoClient(base_url="http://platform.test"), run_id="r", intake_workspace="ws")
 
-    config = _job_config(tmp_path, _codex(), sandboxed=sandboxed)
+    runtime = _runtime(tmp_path, _codex(), sandboxed=sandboxed, trial_issuer=issuer)
 
-    assert config.agent_import_path == TRIAL_CREDENTIAL_AGENT
-    assert config.agent_kwargs[INNER_AGENT_KWARG] == "codex"
-    assert config.agent_kwargs[CREDENTIAL_ENV_KWARG] == "OPENAI_API_KEY"
+    assert getattr(runtime, "_job_scope") is not None
+    assert getattr(runtime, "_config").agent_name == "codex"
 
 
 _NO_NETWORK = {"environment": {"allow_internet": False}}

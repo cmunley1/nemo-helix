@@ -47,7 +47,6 @@ class TrialClaims(BaseModel):
     v: Literal[1] = 1
     kind: Literal["trial"] = "trial"
     session: str = Field(min_length=1, max_length=256, description="The trial's Intake session.")
-    attempt: int = Field(ge=0, description="Which of Harbor's attempts at the trial the token was issued for.")
     intake_workspace: str = Field(min_length=1, max_length=256)
     evaluation: str | None = Field(default=None, max_length=256)
     task: str | None = Field(default=None, max_length=256)

@@ -20,7 +20,6 @@ SERVICE_NAME = "nemo-evals"
 SESSION_ATTRIBUTE = "gen_ai.conversation.id"
 EVALUATION_ATTRIBUTE = "nemo.evaluation.name"
 TEST_CASE_ATTRIBUTE = "nemo.test_case.name"
-ATTEMPT_ATTRIBUTE = "nemo.trial.attempt"
 # Marks a call span recorded by the gateway, whose usage is what the provider reported for the call.
 GATEWAY_CALL_ATTRIBUTE = "nemo.inference_gateway.call"
 
@@ -88,12 +87,12 @@ def call_span(
     )
     return _resource_spans(
         span,
-        {**attributes, GATEWAY_CALL_ATTRIBUTE: True, ATTEMPT_ATTRIBUTE: trial.attempt, **_trial_attributes(trial)},
+        {**attributes, GATEWAY_CALL_ATTRIBUTE: True, **_trial_attributes(trial)},
     )
 
 
-def trial_root_span(trial: TrialClaims, *, started_at: datetime, ended_at: datetime) -> ResourceSpans:
-    """The trial's root span, from when it was first issued a token until its last token ended."""
+def trial_root_span(trial: TrialClaims, *, started_at: datetime, ended_at: datetime, failed: bool) -> ResourceSpans:
+    """The trial's root span, from the start of its first attempt to the end of its last."""
     span = Span(
         trace_id=bytes.fromhex(trial.trace_id),
         span_id=bytes.fromhex(trial.root_span_id),
@@ -101,6 +100,6 @@ def trial_root_span(trial: TrialClaims, *, started_at: datetime, ended_at: datet
         kind=Span.SPAN_KIND_INTERNAL,
         start_time_unix_nano=_nanos(started_at),
         end_time_unix_nano=_nanos(ended_at),
-        status=Status(code=Status.STATUS_CODE_OK),
+        status=Status(code=Status.STATUS_CODE_ERROR if failed else Status.STATUS_CODE_OK),
     )
     return _resource_spans(span, {**_trial_attributes(trial), "gen_ai.operation.name": "invoke_agent"})

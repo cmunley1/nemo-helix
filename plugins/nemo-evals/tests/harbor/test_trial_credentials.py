@@ -5,85 +5,193 @@
 
 from __future__ import annotations
 
-import contextlib
+import asyncio
 import json
-from collections.abc import Generator
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
-from harbor.agents.nop import NopAgent
-from harbor.models.agent.context import AgentContext
+from harbor.job import DatasetConfig, Job, JobConfig
+from harbor.models.job.config import RetryConfig
+from harbor.models.trial.config import AgentConfig, TrialConfig
+from harbor.models.trial.result import ExceptionInfo, TrialResult
+from harbor.trial.hooks import TrialEvent, TrialHookEvent
 from nemo_evals.harbor import trial_credentials
-from nemo_evals.harbor.agent_setup_egress import INNER_AGENT_KWARG as SETUP_INNER_KWARG
-from nemo_evals.harbor.agent_setup_egress import SETUP_EGRESS_AGENT, SETUP_HOSTS_KWARG
-from nemo_evals.harbor.trial_credentials import (
-    CREDENTIAL_ENV_KWARG,
-    INNER_AGENT_KWARG,
-    TRIAL_CREDENTIAL_AGENT,
-    IssuedCredential,
-    TrialCredentialIssuer,
-    issuing,
-    with_trial_credentials,
-)
+from nemo_evals.harbor.trial_credentials import TrialCredentialIssuer, gateway_job_scope
 from nemo_evals.intake.mapping import session_id_for
-from nemo_evals.jobs.gateway_agents import GATEWAY_PLACEHOLDER_KEY
-from nemo_evals.trial_tokens import (
-    TOKEN_LIFETIME_SEC,
-    ModelAccess,
-    TrialClaims,
-    TrialPolicy,
-    TrialTokenReader,
-    unsigned_trial_token,
-)
+from nemo_evals.trial_tokens import TOKEN_LIFETIME_SEC, ModelAccess, TrialClaims, TrialPolicy, TrialTokenReader
 from nemo_helix_plugin.client.client import AsyncNemoClient
+from nemo_helix_plugin.client.oidc import NHXOIDCConfig
 from nhx_evals_sdk.agent_eval.runtimes.harbor.runtime import HarborRuntimeConfig
-from nhx_evals_sdk.agent_eval.runtimes.provenance import require_no_plaintext_credentials
 from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import ExportTraceServiceRequest
-from opentelemetry.proto.trace.v1.trace_pb2 import Span
+from opentelemetry.proto.trace.v1.trace_pb2 import Status
 
-TRIAL = "hello-world__AbC123"
 RUN = "run-1-task-0"
 KEY_ENV = "OPENAI_API_KEY"
-CLAIMS = TrialClaims(
-    session=session_id_for(RUN, TRIAL),
-    attempt=0,
-    intake_workspace="evals",
-    evaluation="run-1",
-    policy=TrialPolicy(model_access=ModelAccess.CLOSED),
-)
+ACCESS_KEYS = "/apis/auth/v2/access-keys"
+OTLP = "/apis/intake/v2/workspaces/evals/ingest/otlp/v1/traces"
+STARTED = datetime(2026, 10, 28, 12, 0, tzinfo=UTC)
 
 
 class Platform:
-    """Answers the issuer's platform calls by method and path, and keeps every request it saw."""
+    """Answers the issuer's platform calls, minting a numbered key per request, and keeps every request it saw."""
 
-    def __init__(self, answers: dict[tuple[str, str], httpx.Response]) -> None:
-        self.answers = answers
+    def __init__(self, *, auth_enabled: bool) -> None:
+        self.auth_enabled = auth_enabled
+        self.refuse_mint_number: int | None = None
+        self.hold_mint_number: int | None = None
+        self.mint_held = asyncio.Event()
+        self.revocations_to_refuse = 0
         self.seen: list[httpx.Request] = []
+        self._revoked: list[str] = []
 
-    def __call__(self, request: httpx.Request) -> httpx.Response:
+    async def __call__(self, request: httpx.Request) -> httpx.Response:
         self.seen.append(request)
-        return self.answers.get((request.method, request.url.path), httpx.Response(500, json={"detail": "unexpected"}))
+        if request.method == "POST" and request.url.path == ACCESS_KEYS:
+            number = len(self.minted()) - 1
+            if number == self.refuse_mint_number:
+                return httpx.Response(503, json={"detail": "unavailable"})
+            if number == self.hold_mint_number:
+                self.mint_held.set()
+                await asyncio.Event().wait()
+            return _minted(number)
+        if request.method == "DELETE" and request.url.path.startswith(ACCESS_KEYS):
+            if self.revocations_to_refuse:
+                self.revocations_to_refuse -= 1
+                return httpx.Response(503, json={"detail": "unavailable"})
+            jti = request.url.path.rsplit("/", 1)[-1]
+            self._revoked.append(jti)
+            return httpx.Response(200, json={"jti": jti, "revoked": True})
+        if request.method == "POST" and request.url.path == OTLP:
+            return httpx.Response(200, json={})
+        return httpx.Response(500, json={"detail": "unexpected"})
 
-    def bodies(self, method: str, path: str) -> list[Any]:
-        return [request.content for request in self.seen if request.method == method and request.url.path == path]
+    def minted(self) -> list[dict[str, Any]]:
+        return [json.loads(r.content) for r in self.seen if r.method == "POST" and r.url.path == ACCESS_KEYS]
+
+    def revoked(self) -> list[str]:
+        return list(self._revoked)
+
+    def root_span_failures(self) -> list[bool]:
+        return [
+            ExportTraceServiceRequest.FromString(r.content).resource_spans[0].scope_spans[0].spans[0].status.code
+            == Status.STATUS_CODE_ERROR
+            for r in self.seen
+            if r.url.path == OTLP
+        ]
+
+    def root_spans(self) -> list[tuple[int, int]]:
+        spans = []
+        for request in self.seen:
+            if request.url.path == OTLP:
+                (span,) = ExportTraceServiceRequest.FromString(request.content).resource_spans[0].scope_spans[0].spans
+                spans.append((span.start_time_unix_nano, span.end_time_unix_nano))
+        return spans
 
 
-ACCESS_KEYS = "/apis/auth/v2/access-keys"
-OTLP = "/apis/intake/v2/workspaces/evals/ingest/otlp/v1/traces"
+def _jti(number: int) -> str:
+    return f"ak_{number:032d}"
 
 
-@pytest.fixture
-def platform(monkeypatch: pytest.MonkeyPatch) -> Platform:
-    platform = Platform({})
+def _minted(number: int) -> httpx.Response:
+    return httpx.Response(
+        200,
+        json={
+            "jti": _jti(number),
+            "principal": "user@example.com",
+            "status": "ACTIVE",
+            "issuer": "nemo",
+            "audiences": ["nemo"],
+            "scope": ["inference"],
+            "created_at": "2026-10-26T12:00:00Z",
+            "token": f"minted-token-{number}",
+            "token_type": "Bearer",
+        },
+    )
+
+
+@pytest.fixture(params=[False, True], ids=["auth off", "auth on"])
+def platform(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> Platform:
+    platform = Platform(auth_enabled=request.param)
     real_client = httpx.AsyncClient
 
     def client(**kwargs: Any) -> httpx.AsyncClient:
         return real_client(transport=httpx.MockTransport(platform), **kwargs)
 
     monkeypatch.setattr(trial_credentials.httpx, "AsyncClient", client)
+    monkeypatch.setattr(
+        trial_credentials, "discover_nhx_config", lambda base_url: NHXOIDCConfig(auth_enabled=platform.auth_enabled)
+    )
     return platform
+
+
+@pytest.fixture
+def auth_on(platform: Platform) -> Platform:
+    if not platform.auth_enabled:
+        pytest.skip("only auth-on platforms mint keys")
+    return platform
+
+
+@pytest.fixture
+async def job(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Job:
+    """A planned Harbor job: two attempts at one task, each retried once."""
+    task = tmp_path / "dataset" / "hello-world"
+    (task / "environment").mkdir(parents=True)
+    (task / "tests").mkdir()
+    (task / "task.toml").write_text('[task]\nname = "trial-rec/hello-world"\n')
+    (task / "instruction.md").write_text("Say hello.\n")
+    (task / "environment" / "Dockerfile").write_text("FROM scratch\n")
+    (task / "tests" / "test.sh").write_text("exit 0\n")
+    monkeypatch.setenv("USERS_KEY", "users-own-key")
+    return await Job.create(
+        JobConfig(
+            job_name="job",
+            jobs_dir=tmp_path / "jobs",
+            n_attempts=2,
+            retry=RetryConfig(max_retries=1),
+            agents=[AgentConfig(name="codex", env={KEY_ENV: "${USERS_KEY}", "OTHER": "kept"})],
+            datasets=[DatasetConfig(path=tmp_path / "dataset")],
+        )
+    )
+
+
+class Hooks:
+    """The trial hooks the issuer registers on the job, fired the way Harbor fires them."""
+
+    def __init__(self, job: Job, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.ended: list[Any] = []
+        self.cancelled: list[Any] = []
+        monkeypatch.setattr(job, "on_trial_ended", self.ended.append)
+        monkeypatch.setattr(job, "on_trial_cancelled", self.cancelled.append)
+
+    async def end(self, config: TrialConfig, *, error: str | None = None, minutes: int = 1) -> None:
+        exception_info = (
+            None
+            if error is None
+            else ExceptionInfo(exception_type=error, exception_message="", exception_traceback="", occurred_at=STARTED)
+        )
+        result = TrialResult.model_construct(
+            started_at=STARTED.replace(minute=minutes - 1),
+            finished_at=STARTED.replace(minute=minutes),
+            exception_info=exception_info,
+        )
+        for hook in self.ended:
+            await hook(_event(TrialEvent.END, config, result))
+
+    async def cancel(self, config: TrialConfig) -> None:
+        for hook in self.cancelled:
+            await hook(_event(TrialEvent.CANCEL, config, TrialResult.model_construct()))
+
+
+def _event(event: TrialEvent, config: TrialConfig, result: TrialResult) -> TrialHookEvent:
+    return TrialHookEvent.model_construct(event=event, task_name="hello-world", config=config, result=result)
+
+
+@pytest.fixture
+def hooks(job: Job, monkeypatch: pytest.MonkeyPatch) -> Hooks:
+    return Hooks(job, monkeypatch)
 
 
 def _issuer() -> TrialCredentialIssuer:
@@ -96,257 +204,140 @@ def _issuer() -> TrialCredentialIssuer:
     )
 
 
-def _trial_dir(tmp_path: Path, name: str = TRIAL) -> Path:
-    trial_dir = tmp_path / name
-    trial_dir.mkdir(exist_ok=True)
-    return trial_dir
-
-
-@pytest.mark.parametrize("agent_key", [GATEWAY_PLACEHOLDER_KEY, None])
-async def test_without_a_user_key_a_trial_gets_an_unsigned_trial_token(
-    platform: Platform, tmp_path: Path, agent_key: str | None
-) -> None:
-    """Platform auth is off whenever the agent holds the placeholder, so there is no key to sign a token."""
-    issued = await _issuer().issue(_trial_dir(tmp_path), agent_key=agent_key)
-
-    assert issued is not None and issued.access_key_jti is None
-    assert issued.trial == CLAIMS
-    assert await TrialTokenReader(None).trial(issued.credential) == CLAIMS
-    assert platform.seen == []
-
-
-def _minted(token: str = "minted-token", jti: str = "ak_" + "1" * 32) -> httpx.Response:
-    return httpx.Response(
-        200,
-        json={
-            "jti": jti,
-            "principal": "user@example.com",
-            "status": "ACTIVE",
-            "issuer": "nemo",
-            "audiences": ["nemo"],
-            "scope": ["inference"],
-            "created_at": "2026-10-26T12:00:00Z",
-            "token": token,
-            "token_type": "Bearer",
-        },
+def _claims(config: TrialConfig) -> TrialClaims:
+    return TrialClaims(
+        session=session_id_for(RUN, config.trial_name),
+        intake_workspace="evals",
+        evaluation="run-1",
+        task="trial-rec/hello-world",
+        policy=TrialPolicy(model_access=ModelAccess.CLOSED),
     )
 
 
-async def test_with_a_user_key_a_trial_gets_an_access_key_carrying_its_claims(
-    platform: Platform, tmp_path: Path
+async def test_each_trial_runs_with_its_own_token_in_place_of_the_agents_key(platform: Platform, job: Job) -> None:
+    configs = job._remaining_trial_configs
+
+    async with _issuer().job_scope(KEY_ENV)(job):
+        tokens = [config.agent.env[KEY_ENV] for config in configs]
+        assert len(set(tokens)) == len(configs) == 2
+        assert all(config.agent.env["OTHER"] == "kept" for config in configs)
+        if platform.auth_enabled:
+            assert tokens == ["minted-token-0", "minted-token-1"]
+            assert [body["service_attributes"] for body in platform.minted()] == [
+                _claims(config).service_attributes() for config in configs
+            ]
+        else:
+            assert [await TrialTokenReader(None).trial(token) for token in tokens] == [_claims(c) for c in configs]
+            assert platform.seen == []
+
+
+async def test_a_minted_key_is_an_inference_key_that_expires_in_a_day(auth_on: Platform, job: Job) -> None:
+    async with _issuer().job_scope(KEY_ENV)(job):
+        pass
+
+    body = auth_on.minted()[0]
+    assert body["scope"] == ["inference"]
+    assert body["expires_in_seconds"] == TOKEN_LIFETIME_SEC
+
+
+async def test_a_key_that_cant_be_minted_fails_the_job_before_any_trial_runs(auth_on: Platform, job: Job) -> None:
+    auth_on.refuse_mint_number = 1
+
+    with pytest.raises(RuntimeError, match="could not issue 1 of 2 trials"):
+        async with _issuer().job_scope(KEY_ENV)(job):
+            pytest.fail("the job ran")
+
+    assert auth_on.revoked() == [_jti(0)]
+
+
+async def test_keys_minted_before_the_job_is_cancelled_are_revoked(auth_on: Platform, job: Job) -> None:
+    auth_on.hold_mint_number = 1
+
+    async def run() -> None:
+        async with _issuer().job_scope(KEY_ENV)(job):
+            pytest.fail("the job ran")
+
+    task = asyncio.create_task(run())
+    await auth_on.mint_held.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert auth_on.revoked() == [_jti(0)]
+
+
+async def test_a_key_that_couldnt_be_revoked_is_revoked_when_the_job_ends(
+    auth_on: Platform, job: Job, hooks: Hooks
 ) -> None:
-    platform.answers[("POST", ACCESS_KEYS)] = _minted()
+    first, _ = job._remaining_trial_configs
+    auth_on.revocations_to_refuse = 1
 
-    issued = await _issuer().issue(_trial_dir(tmp_path), agent_key="users-own-key")
+    async with _issuer().job_scope(KEY_ENV)(job):
+        await hooks.end(first)
+        assert auth_on.revoked() == []
 
-    assert issued == IssuedCredential("minted-token", CLAIMS, "ak_" + "1" * 32)
-    [key_request] = [json.loads(content) for content in platform.bodies("POST", ACCESS_KEYS)]
-    assert key_request["scope"] == ["inference"]
-    assert key_request["name"] == f"nemo-evals-trial {CLAIMS.session}"
-    assert key_request["expires_in_seconds"] == TOKEN_LIFETIME_SEC
-    assert key_request["service_attributes"] == CLAIMS.service_attributes()
+    assert sorted(auth_on.revoked()) == [_jti(0), _jti(1)]
 
 
-async def test_each_attempt_at_a_trial_is_counted(platform: Platform, tmp_path: Path) -> None:
-    """Harbor retries a trial under the same name, so its attempts share a session and differ by attempt."""
-    issuer = _issuer()
+async def test_a_trial_that_ends_without_error_is_recorded_and_its_key_revoked(
+    platform: Platform, job: Job, hooks: Hooks
+) -> None:
+    first, _ = job._remaining_trial_configs
 
-    attempts = [await issuer.issue(_trial_dir(tmp_path), agent_key=None) for _ in range(2)]
-    other = await issuer.issue(_trial_dir(tmp_path, "hello-world__ZyX987"), agent_key=None)
+    async with _issuer().job_scope(KEY_ENV)(job):
+        await hooks.end(first)
+        assert platform.root_spans() == [(_nanos(STARTED), _nanos(STARTED.replace(minute=1)))]
+        assert platform.root_span_failures() == [False]
+        assert platform.revoked() == ([_jti(0)] if platform.auth_enabled else [])
 
-    assert [issued.trial.attempt for issued in attempts if issued is not None] == [0, 1]
-    assert other is not None and other.trial.attempt == 0
 
+async def test_a_trial_keeps_its_key_while_harbor_will_retry_it(auth_on: Platform, job: Job, hooks: Hooks) -> None:
+    first, _ = job._remaining_trial_configs
 
-async def test_a_key_that_cannot_be_minted_leaves_the_agent_its_users_key(platform: Platform, tmp_path: Path) -> None:
-    platform.answers[("POST", ACCESS_KEYS)] = httpx.Response(404, json={"detail": "Scoped Access Keys are not enabled"})
+    async with _issuer().job_scope(KEY_ENV)(job):
+        await hooks.end(first, error="RuntimeError", minutes=1)
+        assert auth_on.revoked() == []
+        await hooks.end(first, error="RuntimeError", minutes=3)
+        assert auth_on.revoked() == [_jti(0)]
 
-    assert await _issuer().issue(_trial_dir(tmp_path), agent_key="users-own-key") is None
+    assert auth_on.root_spans()[-1] == (_nanos(STARTED), _nanos(STARTED.replace(minute=3)))
 
 
-def _root_spans(platform: Platform) -> list[Span]:
-    return [
-        span
-        for export in platform.bodies("POST", OTLP)
-        for resource in ExportTraceServiceRequest.FromString(export).resource_spans
-        for scope in resource.scope_spans
-        for span in scope.spans
-    ]
+async def test_an_error_harbor_doesnt_retry_ends_the_trial(auth_on: Platform, job: Job, hooks: Hooks) -> None:
+    first, _ = job._remaining_trial_configs
 
+    async with _issuer().job_scope(KEY_ENV)(job):
+        await hooks.end(first, error="AgentTimeoutError")
+        assert auth_on.revoked() == [_jti(0)]
+        assert auth_on.root_span_failures() == [True]
 
-async def test_ending_a_token_records_the_trials_root_then_revokes_its_key(platform: Platform) -> None:
-    jti = "ak_" + "3" * 32
-    platform.answers[("DELETE", f"{ACCESS_KEYS}/{jti}")] = httpx.Response(200, json={"jti": jti, "revoked": True})
-    platform.answers[("POST", OTLP)] = httpx.Response(200, json={})
 
-    await _issuer().end(IssuedCredential("minted-token", CLAIMS, jti))
+async def test_a_cancelled_trial_has_its_key_revoked_and_is_still_recorded(
+    platform: Platform, job: Job, hooks: Hooks
+) -> None:
+    """Harbor ends a cancelled trial after cancelling it, with an error it would otherwise retry."""
+    first, _ = job._remaining_trial_configs
 
-    paths = [(request.method, request.url.path) for request in platform.seen]
-    assert paths == [("POST", OTLP), ("DELETE", f"{ACCESS_KEYS}/{jti}")]
-    [span] = _root_spans(platform)
-    assert span.trace_id.hex() == CLAIMS.trace_id and span.span_id.hex() == CLAIMS.root_span_id
-    assert not span.parent_span_id
+    async with _issuer().job_scope(KEY_ENV)(job):
+        await hooks.cancel(first)
+        assert platform.revoked() == ([_jti(0)] if platform.auth_enabled else [])
+        await hooks.end(first, error="CancelledError")
+        assert len(platform.root_spans()) == 1
 
 
-async def test_the_root_span_runs_from_the_first_attempt_to_the_last(platform: Platform, tmp_path: Path) -> None:
-    """Every attempt rewrites the same root span, so each must give it the trial's first start."""
-    platform.answers[("POST", OTLP)] = httpx.Response(200, json={})
-    issuer = _issuer()
+async def test_the_job_ending_revokes_every_key_still_live(auth_on: Platform, job: Job, hooks: Hooks) -> None:
+    first, _ = job._remaining_trial_configs
 
-    for _ in range(2):
-        issued = await issuer.issue(_trial_dir(tmp_path), agent_key=None)
-        assert issued is not None
-        await issuer.end(issued)
+    async with _issuer().job_scope(KEY_ENV)(job):
+        await hooks.end(first)
 
-    first, last = _root_spans(platform)
-    assert first.span_id == last.span_id
-    assert first.start_time_unix_nano == last.start_time_unix_nano
-    assert last.end_time_unix_nano > first.end_time_unix_nano
+    assert sorted(auth_on.revoked()) == [_jti(0), _jti(1)]
 
 
-async def test_an_unreachable_platform_never_fails_the_trial(platform: Platform, tmp_path: Path) -> None:
-    assert await _issuer().issue(_trial_dir(tmp_path), agent_key="users-own-key") is None
-    await _issuer().end(IssuedCredential("token", CLAIMS, "ak_" + "5" * 32))
+@pytest.mark.parametrize("agent", ["oracle", "nop"])
+def test_an_agent_that_calls_no_model_gets_no_tokens(agent: str) -> None:
+    assert gateway_job_scope(HarborRuntimeConfig(agent_name=agent), _issuer(), KEY_ENV) is None
 
 
-# --- the agent wrapper ----------------------------------------------------------------------------------
-
-
-class Environment:
-    def __init__(self) -> None:
-        self.overlays: list[dict[str, str]] = []
-
-    @contextlib.contextmanager
-    def scoped_exec_env(self, env: dict[str, str]) -> Generator[None]:
-        self.overlays.append(env)
-        yield
-
-
-class RecordingAgent(NopAgent):
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs)
-        self.saw_in_setup: str | None = None
-        self.saw_in_run: str | None = None
-
-    async def setup(self, environment: Any) -> None:
-        self.saw_in_setup = self._extra_env.get(KEY_ENV)
-
-    async def run(self, instruction: str, environment: Any, context: AgentContext) -> None:
-        self.saw_in_run = self.extra_env.get(KEY_ENV)
-
-
-class FakeIssuer:
-    def __init__(self, issued: IssuedCredential | None) -> None:
-        self.issued = issued
-        self.issued_for: list[tuple[str, str | None]] = []
-        self.ended: list[IssuedCredential] = []
-
-    async def issue(self, trial_dir: Path, *, agent_key: str | None) -> IssuedCredential | None:
-        self.issued_for.append((trial_dir.name, agent_key))
-        return self.issued
-
-    async def end(self, issued: IssuedCredential) -> None:
-        self.ended.append(issued)
-
-
-def _agent(tmp_path: Path) -> Any:
-    wrapped = trial_credentials._with_trial_credential(RecordingAgent, KEY_ENV)
-    return wrapped(logs_dir=tmp_path / TRIAL / "agent", extra_env={KEY_ENV: GATEWAY_PLACEHOLDER_KEY})
-
-
-async def test_the_agent_calls_with_its_trials_credential_from_setup_on(tmp_path: Path) -> None:
-    issued = IssuedCredential(unsigned_trial_token(CLAIMS), CLAIMS, None)
-    issuer = FakeIssuer(issued)
-    agent, environment = _agent(tmp_path), Environment()
-
-    with issuing(issuer):  # ty: ignore[invalid-argument-type]  # a stand-in issuer
-        await agent.setup(environment)
-        await agent.run("do it", environment, AgentContext())
-
-    assert issuer.issued_for == [(TRIAL, GATEWAY_PLACEHOLDER_KEY)]
-    assert agent.saw_in_setup == agent.saw_in_run == issued.credential
-    assert environment.overlays == [{KEY_ENV: issued.credential}]
-    assert issuer.ended == [issued]
-
-
-class CrashingAgent(RecordingAgent):
-    async def run(self, instruction: str, environment: Any, context: AgentContext) -> None:
-        raise RuntimeError("agent crashed")
-
-
-async def test_an_agent_that_fails_ends_its_credential(tmp_path: Path) -> None:
-    issued = IssuedCredential(unsigned_trial_token(CLAIMS), CLAIMS, None)
-    issuer = FakeIssuer(issued)
-    wrapped = trial_credentials._with_trial_credential(CrashingAgent, KEY_ENV)
-    agent: Any = wrapped(logs_dir=tmp_path / TRIAL / "agent", extra_env={KEY_ENV: GATEWAY_PLACEHOLDER_KEY})
-
-    with issuing(issuer):  # ty: ignore[invalid-argument-type]  # a stand-in issuer
-        await agent.setup(Environment())
-        with pytest.raises(RuntimeError, match="agent crashed"):
-            await agent.run("do it", Environment(), AgentContext())
-
-    assert issuer.ended == [issued]
-
-
-async def test_without_an_issued_credential_the_agent_keeps_its_key(tmp_path: Path) -> None:
-    issuer = FakeIssuer(None)
-    agent, environment = _agent(tmp_path), Environment()
-
-    with issuing(issuer):  # ty: ignore[invalid-argument-type]  # a stand-in issuer
-        await agent.setup(environment)
-        await agent.run("do it", environment, AgentContext())
-
-    assert agent.saw_in_run == GATEWAY_PLACEHOLDER_KEY
-    assert environment.overlays == [] and issuer.ended == []
-
-
-def _config(**overrides: Any) -> HarborRuntimeConfig:
-    return HarborRuntimeConfig(jobs_dir=Path("/tmp/jobs"), **overrides)
-
-
-def test_the_config_wraps_the_agent_and_names_its_key_variable() -> None:
-    config = with_trial_credentials(_config(agent_name="claude-code", agent_kwargs={"x": 1}), KEY_ENV)
-
-    assert config.agent_import_path == TRIAL_CREDENTIAL_AGENT
-    assert config.agent_kwargs == {"x": 1, INNER_AGENT_KWARG: "claude-code", CREDENTIAL_ENV_KWARG: KEY_ENV}
-    assert config.agent_setup_timeout_multiplier is not None
-
-
-def test_the_wrapped_config_passes_the_runtimes_credential_check() -> None:
-    """The runtime refuses a run whose agent_kwargs look like plaintext credentials, so the wrapper's must not."""
-    config = with_trial_credentials(_config(agent_name="codex"), KEY_ENV)
-
-    require_no_plaintext_credentials(config.agent_kwargs, field="agent_kwargs", alternative="env_secrets")
-
-
-def test_the_config_wraps_an_agent_already_wrapped_for_setup_egress() -> None:
-    egress = _config(
-        agent_name="claude-code",
-        agent_import_path=SETUP_EGRESS_AGENT,
-        agent_kwargs={SETUP_INNER_KWARG: "claude-code", SETUP_HOSTS_KWARG: ["registry.npmjs.org"]},
-        agent_setup_timeout_multiplier=2.5,
-    )
-
-    config = with_trial_credentials(egress, KEY_ENV)
-
-    assert config.agent_kwargs[INNER_AGENT_KWARG] == SETUP_EGRESS_AGENT
-    assert config.agent_setup_timeout_multiplier == 2.5
-    kwargs = dict(config.agent_kwargs)
-    kwargs.pop(INNER_AGENT_KWARG)
-    agent_class = trial_credentials._inner_agent_class(SETUP_EGRESS_AGENT, kwargs)
-    assert agent_class.name() == "claude-code"
-    assert SETUP_INNER_KWARG not in kwargs and SETUP_HOSTS_KWARG not in kwargs
-
-
-@pytest.mark.parametrize(
-    "config",
-    [
-        pytest.param(_config(agent_name="oracle"), id="oracle"),
-        pytest.param(_config(agent_name="nop"), id="nop"),
-        pytest.param(
-            _config(agent_import_path="my_agent:Agent", agent_dir=Path("/agents/mine")), id="loose agent file"
-        ),
-    ],
-)
-def test_agents_that_cannot_or_need_not_be_wrapped_are_left_alone(config: HarborRuntimeConfig) -> None:
-    assert with_trial_credentials(config, KEY_ENV) == config
+def _nanos(at: datetime) -> int:
+    return int(at.timestamp() * 1_000_000_000)

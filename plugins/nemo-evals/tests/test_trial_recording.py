@@ -25,7 +25,7 @@ from nemo_evals.trial_recording import (
     caller_credential,
     usage_from_payload,
 )
-from nemo_evals.trial_spans import ATTEMPT_ATTRIBUTE, GATEWAY_CALL_ATTRIBUTE, SESSION_ATTRIBUTE, TEST_CASE_ATTRIBUTE
+from nemo_evals.trial_spans import GATEWAY_CALL_ATTRIBUTE, SESSION_ATTRIBUTE, TEST_CASE_ATTRIBUTE
 from nemo_evals.trial_tokens import ModelAccess, TrialClaims, TrialPolicy, TrialTokenReader, unsigned_trial_token
 from nemo_helix_plugin.client.oidc import decode_jwt_claims
 from nemo_helix_plugin.inference_middleware import InferenceMiddlewareContext, InferenceRequest, InferenceResponse
@@ -34,7 +34,6 @@ from opentelemetry.proto.trace.v1.trace_pb2 import ResourceSpans, Span
 NOW = datetime.now(UTC)
 TRIAL = TrialClaims(
     session="run-1:hello__abc",
-    attempt=1,
     intake_workspace="evals",
     evaluation="run-1",
     task="hello",
@@ -191,7 +190,6 @@ async def test_a_call_made_with_a_trial_token_is_recorded_in_the_trial() -> None
     attributes = _attributes(span)
     assert attributes[SESSION_ATTRIBUTE] == TRIAL.session
     assert attributes[TEST_CASE_ATTRIBUTE] == "hello"
-    assert attributes[ATTEMPT_ATTRIBUTE] == 1
     assert attributes[GATEWAY_CALL_ATTRIBUTE] is True
     assert attributes["gen_ai.usage.input_tokens"] == 120
     assert attributes["gen_ai.usage.output_tokens"] == 5
@@ -203,7 +201,7 @@ async def test_a_call_made_with_a_trial_token_is_recorded_in_the_trial() -> None
     "headers",
     [
         pytest.param(
-            {"authorization": f"Bearer {unsigned_trial_token(TRIAL.model_copy(update={'attempt': 2}))}"},
+            {"authorization": f"Bearer {unsigned_trial_token(TRIAL.model_copy(update={'task': 'other'}))}"},
             id="a trial token the platform didn't sign",
         ),
         pytest.param({}, id="no credential"),

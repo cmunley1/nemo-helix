@@ -17,7 +17,6 @@ is written via :func:`~nemo_evals.jobs.result_persistence.persist_agent_eval_res
 
 from __future__ import annotations
 
-import contextlib
 import logging
 import os
 import shutil
@@ -31,7 +30,7 @@ from typing import Any, ClassVar, Literal
 import nemo_evals.agent_seeds  # noqa: F401 - registers the platform 'fileset' workspace-seed handler
 from nemo_evals.config import get_config
 from nemo_evals.harbor.resolution import map_with_limited_concurrency
-from nemo_evals.harbor.trial_credentials import TrialCredentialIssuer, issuing, with_trial_credentials
+from nemo_evals.harbor.trial_credentials import TrialCredentialIssuer, gateway_job_scope
 from nemo_evals.jobs.agent_compiler import (
     _compile_agent_eval_cpu_job,
     _secret_refs,
@@ -492,13 +491,15 @@ class _AgentEvalJobBase(NemoJob):
         ctx: JobContext,
         *,
         configure_harbor: Callable[[HarborRuntimeConfig], HarborRuntimeConfig] | None = None,
+        trial_issuer: TrialCredentialIssuer | None = None,
     ) -> tuple[AgentEvalTarget | None, str | dict[str, Any] | None, RunConfigOnline | RunConfigOnlineModel | None]:
         """Resolve a target spec to ``(runtime target, prompt_template, params)`` for the SDK run config.
 
         Endpoint targets carry their own request config; a runner is instantiated to its runtime and
         shapes its own request, so it contributes neither a prompt template nor inference params.
         ``configure_harbor`` adjusts a Harbor runner's config last (a Kubernetes task Job selects its
-        sandbox environment there).
+        sandbox environment there). ``trial_issuer`` issues each trial of a Harbor agent that calls a gateway
+        model its own gateway key.
         """
         if isinstance(target, ModelTarget):
             return target.model, target.prompt_template, target.params or RunConfigOnlineModel()
@@ -556,11 +557,15 @@ class _AgentEvalJobBase(NemoJob):
                 harbor_config = point_agent_at_gateway_model(
                     harbor_config.model_copy(update={"agent_kwargs": agent_kwargs}), target, origin
                 )
-                if target.gateway_model is not None and target.gateway_agent_env is not None:
-                    harbor_config = with_trial_credentials(harbor_config, target.gateway_agent_env.api_key_env)
+            job_scope = (
+                gateway_job_scope(harbor_config, trial_issuer, target.gateway_agent_env.api_key_env)
+                if trial_issuer is not None and target.gateway_agent_env is not None
+                else None
+            )
             harbor_runtime = HarborAgentTaskRunner(
                 config=harbor_config,
                 secret_resolver=JobEnvSecretSource(workspace=ctx.workspace),
+                job_scope=job_scope,
             )
             return harbor_runtime, None, None
         return None, None, None
@@ -611,14 +616,16 @@ class _AgentEvalJobBase(NemoJob):
             for task in get_adapter(kind, prepare_ctx.adapters).prepare(group, prepare_ctx)
         ]
         self._prepared_tasks(tasks)
+        run_id = self._run_id() or f"agent-eval-{datetime.now(UTC):%Y%m%d%H%M%S}-{uuid.uuid4().hex[:8]}"
         target, prompt_template, params = self._resolve_target(
-            spec.target, ctx, configure_harbor=lambda harbor_config: self._configure_harbor_runtime(harbor_config, ctx)
+            spec.target,
+            ctx,
+            configure_harbor=lambda harbor_config: self._configure_harbor_runtime(harbor_config, ctx),
+            trial_issuer=_trial_credential_issuer(spec, ctx, platform_client, async_client, run_id),
         )
         bundle_dir = ctx.storage.persistent / AGENT_BUNDLE_DIR
         if bundle_dir.exists():
             shutil.rmtree(bundle_dir)
-        run_id = self._run_id() or f"agent-eval-{datetime.now(UTC):%Y%m%d%H%M%S}-{uuid.uuid4().hex[:8]}"
-        issuer = _trial_credential_issuer(spec, ctx, platform_client, async_client, run_id)
         run_config = AgentEvalRunConfig(
             params=params,
             prompt_template=prompt_template,
@@ -639,10 +646,9 @@ class _AgentEvalJobBase(NemoJob):
                 request_logs,
                 include_trial_measurements=include_trial_measurements,
             ) as usage_capture:
-                with issuing(issuer) if issuer is not None else contextlib.nullcontext():
-                    result = usage_capture.record(
-                        evaluator.run_sync(tasks=tasks, trials=spec.trials, target=target, config=run_config)
-                    )
+                result = usage_capture.record(
+                    evaluator.run_sync(tasks=tasks, trials=spec.trials, target=target, config=run_config)
+                )
 
         files = self._write_result_files(result, ctx.storage.persistent)
         artifact = ctx.results.save(DEFAULT_RESULT_NAME, files.bundle_dir)

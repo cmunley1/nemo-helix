@@ -25,7 +25,6 @@ from nemo_evals.harbor.agent_setup_egress import (
     INNER_AGENT_KWARG,
     SETUP_EGRESS_AGENT,
     SETUP_HOSTS_KWARG,
-    UNWRAPPED_AGENTS,
     setup_timeout_multiplier,
 )
 from nemo_evals.harbor.compose.spec import compose_services_kwarg
@@ -59,6 +58,8 @@ DISPATCH_STEP_NAME = "harbor-task-dispatch"
 DISPATCH_ENTRYPOINT = ["python", "-m"]
 DISPATCH_COMMAND = ["nemo_evals.tasks.harbor_task_dispatch"]
 OPENSANDBOX_ENVIRONMENT = "nemo_evals.harbor.opensandbox_environment:AgentChannelOpenSandboxEnvironment"
+UNWRAPPED_AGENTS = frozenset({"oracle", "nop"})
+"""Agents that install nothing, and that Harbor constructs or scores differently by name, so they stay unwrapped."""
 """Harbor environment the task Job runs trials in: nhx-sandbox's environment plus the agent channel."""
 
 SANDBOX_READY_TIMEOUT_S = 600

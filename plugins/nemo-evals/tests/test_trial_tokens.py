@@ -27,7 +27,6 @@ from nemo_helix_plugin.client.oidc import decode_jwt_claims, decode_jwt_header, 
 
 TRIAL = TrialClaims(
     session=session_id_for("run-1", "hello__abc1234"),
-    attempt=0,
     intake_workspace="evals",
     evaluation="bench",
     task="trial-rec/hello-world",
@@ -72,7 +71,6 @@ def test_the_claims_fit_what_the_auth_service_accepts_as_service_attributes() ->
         "v": 1,
         "kind": "trial",
         "session": "run-1:hello__abc1234",
-        "attempt": 0,
         "intake_workspace": "evals",
         "evaluation": "bench",
         "task": "trial-rec/hello-world",
@@ -195,7 +193,7 @@ async def test_a_failed_check_is_not_remembered() -> None:
 
 
 async def test_the_reader_remembers_at_most_its_limit_of_tokens() -> None:
-    tokens = [unsigned_trial_token(TRIAL.model_copy(update={"attempt": n})) for n in range(3)]
+    tokens = [unsigned_trial_token(TRIAL.model_copy(update={"task": f"task-{n}"})) for n in range(3)]
     verify = Verifier(*tokens)
     reader = TrialTokenReader(verify, max_cached_tokens=2)
 
