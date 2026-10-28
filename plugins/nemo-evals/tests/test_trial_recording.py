@@ -479,6 +479,20 @@ async def test_a_batch_that_cant_be_sent_before_shutdown_counts_as_dropped() -> 
     assert recorder.dropped == 2
 
 
+async def test_calls_the_shutdown_flush_cant_send_count_as_dropped() -> None:
+    async def hanging_sink(workspace: str, spans: list[ResourceSpans]) -> int:
+        await asyncio.Event().wait()
+        return 0
+
+    recorder = CallRecorder(_reader(TOKEN), hanging_sink, max_batch_size=2, flush_interval_sec=60)
+    for _ in range(3):
+        recorder.record(_finished())
+
+    await recorder.stop(timeout_sec=0.05)
+
+    assert recorder.dropped == 3
+
+
 async def test_a_batch_is_split_to_fit_intakes_body_limit(monkeypatch: pytest.MonkeyPatch) -> None:
     sink = Sink()
     recorder = CallRecorder(_reader(TOKEN), sink, flush_interval_sec=60)

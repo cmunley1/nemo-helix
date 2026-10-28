@@ -201,6 +201,7 @@ class CallRecorder:
         self._queue: asyncio.Queue[FinishedCall] = asyncio.Queue(maxsize=max_queued_calls)
         self._collecting: list[FinishedCall] = []
         self._sending: list[FinishedCall] = []
+        self._flushing: list[FinishedCall] = []
         self._max_batch_size = max_batch_size
         self._flush_interval_sec = flush_interval_sec
         self._task: asyncio.Task[None] | None = None
@@ -244,15 +245,20 @@ class CallRecorder:
         try:
             await asyncio.wait_for(self.flush(), timeout=max(0.0, deadline - time.monotonic()))
         except TimeoutError:
-            logger.warning("Dropped %d queued trial calls at shutdown", self._queue.qsize())
+            lost = len(self._flushing) + self._queue.qsize()
+            self._dropped += lost
+            self._flushing = []
+            logger.warning("Dropped %d queued trial calls at shutdown", lost)
 
     async def flush(self) -> None:
         """Send everything queued now, starting with any batch the sender was still collecting."""
         if self._collecting:
-            batch, self._collecting = self._collecting, []
-            await self._send(batch)
+            self._flushing, self._collecting = self._collecting, []
+            await self._send(self._flushing)
         while not self._queue.empty():
-            await self._send(self._take_batch())
+            self._flushing = self._take_batch()
+            await self._send(self._flushing)
+        self._flushing = []
 
     async def _run(self) -> None:
         while not self._stopping:

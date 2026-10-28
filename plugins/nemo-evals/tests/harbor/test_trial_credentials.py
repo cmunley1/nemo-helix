@@ -44,6 +44,9 @@ class Platform:
         self.hold_mint_number: int | None = None
         self.mint_held = asyncio.Event()
         self.revocations_to_refuse = 0
+        self.hold_revocations = False
+        self.revocation_held = asyncio.Event()
+        self.release_revocations = asyncio.Event()
         self.seen: list[httpx.Request] = []
         self._revoked: list[str] = []
 
@@ -58,6 +61,9 @@ class Platform:
                 await asyncio.Event().wait()
             return _minted(number)
         if request.method == "DELETE" and request.url.path.startswith(ACCESS_KEYS):
+            if self.hold_revocations:
+                self.revocation_held.set()
+                await self.release_revocations.wait()
             if self.revocations_to_refuse:
                 self.revocations_to_refuse -= 1
                 return httpx.Response(503, json={"detail": "unavailable"})
@@ -267,6 +273,24 @@ async def test_keys_minted_before_the_job_is_cancelled_are_revoked(auth_on: Plat
         await task
 
     assert auth_on.revoked() == [_jti(0)]
+
+
+async def test_cancelling_the_job_during_cleanup_still_revokes_every_key(auth_on: Platform, job: Job) -> None:
+    """The job's scope doesn't end, closing the platform client, until its revocations have."""
+    auth_on.hold_revocations = True
+
+    async def run() -> None:
+        async with _issuer().job_scope(KEY_ENV)(job):
+            pass
+
+    task = asyncio.create_task(run())
+    await auth_on.revocation_held.wait()
+    task.cancel()
+    asyncio.get_running_loop().call_later(0.05, auth_on.release_revocations.set)
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert sorted(auth_on.revoked()) == [_jti(0), _jti(1)]
 
 
 async def test_a_key_that_couldnt_be_revoked_is_revoked_when_the_job_ends(

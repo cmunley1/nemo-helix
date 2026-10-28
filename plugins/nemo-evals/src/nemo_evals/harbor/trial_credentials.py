@@ -81,7 +81,13 @@ class TrialCredentialIssuer:
                 job.on_trial_cancelled(trials.cancelled)
                 yield
             finally:
-                await asyncio.shield(trials.revoke_all())
+                cleanup = asyncio.ensure_future(trials.revoke_all())
+                try:
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError:
+                    # The revocations need the transport, which closes when this block exits.
+                    await cleanup
+                    raise
 
     def _claims(self, config: TrialConfig) -> TrialClaims:
         return TrialClaims(
