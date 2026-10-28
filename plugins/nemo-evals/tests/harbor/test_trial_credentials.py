@@ -18,6 +18,7 @@ from harbor.models.job.config import RetryConfig
 from harbor.models.trial.config import AgentConfig, TrialConfig
 from harbor.models.trial.result import ExceptionInfo, StepResult, TrialResult
 from harbor.trial.hooks import TrialEvent, TrialHookEvent
+from harbor.utils.env import resolve_env_vars
 from nemo_evals.harbor import trial_credentials
 from nemo_evals.harbor.trial_credentials import TrialCredentialIssuer, gateway_job_scope
 from nemo_evals.intake.mapping import session_id_for
@@ -227,7 +228,7 @@ async def test_each_trial_runs_with_its_own_token_in_place_of_the_agents_key(pla
     configs = job._remaining_trial_configs
 
     async with _issuer().job_scope(KEY_ENV)(job):
-        tokens = [config.agent.env[KEY_ENV] for config in configs]
+        tokens = [resolve_env_vars(config.agent.env)[KEY_ENV] for config in configs]
         assert len(set(tokens)) == len(configs) == 2
         assert all(config.agent.env["OTHER"] == "kept" for config in configs)
         if platform.auth_enabled:
@@ -238,6 +239,20 @@ async def test_each_trial_runs_with_its_own_token_in_place_of_the_agents_key(pla
         else:
             assert [await TrialTokenReader(None).trial(token) for token in tokens] == [_claims(c) for c in configs]
             assert platform.seen == []
+
+
+async def test_a_token_is_never_written_into_the_trials_config(auth_on: Platform, job: Job) -> None:
+    """Harbor saves each trial's config and masks only variables named like secrets; this one isn't."""
+    configs = job._remaining_trial_configs
+
+    async with _issuer().job_scope("MODEL_BEARER")(job):
+        saved = " ".join(config.model_dump_json() for config in configs)
+        tokens = [resolve_env_vars(config.agent.env)["MODEL_BEARER"] for config in configs]
+        assert tokens == ["minted-token-0", "minted-token-1"]
+        assert "minted-token" not in saved
+
+    with pytest.raises(ValueError, match="not found"):
+        resolve_env_vars(configs[0].agent.env)
 
 
 async def test_a_minted_key_is_an_inference_key_that_expires_in_a_day(auth_on: Platform, job: Job) -> None:

@@ -8,7 +8,9 @@ tokens and cost two or three times. Instead, each trace sums a metric over the f
 
 1. Inference Gateway call spans (``GATEWAY_CALL_ATTRIBUTE``): the usage the provider reported for each call the
    gateway served. An agent that sends a ``traceparent`` gets them beneath its own spans for the same calls, which
-   then don't count again.
+   then don't count again. They win for a metric only when every gateway call span in the trace recorded usage and
+   one reports the metric; otherwise the trace counts the agent's own spans and none of the gateway's, so a call
+   whose response carried no usage is neither dropped nor counted twice.
 2. Model calls: non-root ``LLM`` and ``EMBEDDING`` spans, other non-root spans of unknown kind, and every ATIF
    span. ATIF ingest already reconciles step and trajectory usage, so an ATIF root only carries a metric when no
    step reported it. A root model span is not a second call: it is the publisher total in the next tier.
@@ -55,14 +57,22 @@ _VALUE = "attributes_number[%({metric}_key)s] AS {metric}_value"
 # filters on the tier alone. multiIf rather than a simple CASE: ClickHouse runs it faster.
 _TRACE_TOTAL = """\
 multiIf(
-    minIf(usage_tier, reports_{metric}) = 1, sumIf({metric}_value, usage_tier = 1),
-    minIf(usage_tier, reports_{metric}) = 2, sumIf({metric}_value, usage_tier = 2),
-    minIf(usage_tier, reports_{metric}) = 3, sumIf({metric}_value, usage_tier = 3),
-    minIf(usage_tier, reports_{metric}) = 4, sumIf({metric}_value, usage_tier = 4),
+    {from_gateway}, sumIf({metric}_value, usage_tier = 1),
+    minIf(usage_tier, reports_{metric} AND usage_tier > 1) = 2, sumIf({metric}_value, usage_tier = 2),
+    minIf(usage_tier, reports_{metric} AND usage_tier > 1) = 3, sumIf({metric}_value, usage_tier = 3),
+    minIf(usage_tier, reports_{metric} AND usage_tier > 1) = 4, sumIf({metric}_value, usage_tier = 4),
     NULL
 )"""
 # Per trace and metric: whether its total came from gateway call spans; and per trace, whether it is marked.
-_FROM_GATEWAY = "minIf(usage_tier, reports_{metric}) = 1 AS {metric}_from_gateway"
+_GATEWAY_COVERS = (
+    "(countIf(usage_tier = 1 AND reports_{metric}) > 0 AND countIf(usage_tier = 1 AND NOT reports_usage) = 0)"
+)
+# Per span: whether it reports any token usage at all. Reads the input and output token keys.
+_REPORTS_USAGE = (
+    "(has(mapKeys(attributes_number), %(input_tokens_key)s) OR has(mapKeys(attributes_number), %(output_tokens_key)s))"
+    " AS reports_usage"
+)
+_FROM_GATEWAY = "{from_gateway} AS {metric}_from_gateway"
 _SUPERSEDED = "max(usage_superseded) AS usage_superseded"
 
 
@@ -71,7 +81,7 @@ class UsageSql:
     """The usage rule for a set of metrics: its per-span and per-trace SELECT columns, and their parameters."""
 
     span_columns: str
-    """``usage_tier`` and ``usage_superseded``, then ``reports_<metric>`` and ``<metric>_value`` for each metric.
+    """``usage_tier``, ``usage_superseded`` and ``reports_usage``, then ``reports_<metric>`` and ``<metric>_value`` for each metric.
     They read the span's ``source_format``, ``kind``, ``external_parent_span_id``, ``attributes_bool`` and
     ``attributes_number`` without a table alias."""
     trace_columns: str
@@ -109,22 +119,26 @@ def usage_sql(metrics: tuple[str, ...] = _ALL_METRICS, *, scaled: bool = True) -
     ``scaled=False`` leaves cost in stored units, for queries that add up traces with ``summed_metric_columns``,
     which then converts it once.
     """
-    span_columns = [_USAGE_TIER, _USAGE_SUPERSEDED]
+    span_columns = [_USAGE_TIER, _USAGE_SUPERSEDED, _REPORTS_USAGE]
     for metric in metrics:
         span_columns += [_REPORTS.format(metric=metric), _VALUE.format(metric=metric)]
 
     trace_columns = []
     for metric in metrics:
-        total = _TRACE_TOTAL.format(metric=metric)
+        from_gateway = _GATEWAY_COVERS.format(metric=metric)
+        total = _TRACE_TOTAL.format(metric=metric, from_gateway=from_gateway)
         if scaled:
             total = _scaled(total, metric)
-        trace_columns += [f"{total} AS {metric}", _FROM_GATEWAY.format(metric=metric)]
+        trace_columns += [f"{total} AS {metric}", _FROM_GATEWAY.format(metric=metric, from_gateway=from_gateway)]
     trace_columns.append(_SUPERSEDED)
 
     return UsageSql(
         span_columns=_select_list(span_columns, indent=16),
         trace_columns=_select_list(trace_columns, indent=12),
-        parameters={f"{metric}_key": spec_for_field(METRIC_ATTRIBUTE_FIELDS[metric]).bag_key for metric in metrics},
+        parameters={
+            f"{metric}_key": spec_for_field(METRIC_ATTRIBUTE_FIELDS[metric]).bag_key
+            for metric in {*metrics, "input_tokens", "output_tokens"}
+        },
     )
 
 

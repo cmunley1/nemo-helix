@@ -382,6 +382,7 @@ def _metric_rollups_sql(*, trace_index_table: str, spans_table: str, evaluation_
                 agent_version,
                 usage_tier,
                 usage_superseded,
+                input_tokens_present OR output_tokens_present AS reports_usage,
                 input_tokens_present AS reports_input_tokens,
                 input_tokens_value,
                 output_tokens_present AS reports_output_tokens,

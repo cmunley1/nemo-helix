@@ -7,6 +7,9 @@ Before a Harbor job runs, each trial it will run gets a trial token (:mod:`nemo_
 environment, in place of the agent's gateway key. With platform auth off, the token is unsigned. With auth on, it is
 a Scoped Access Key minted for the trial on the user's behalf, scoped to inference, and revoked once Harbor won't
 run the trial again. If any key can't be minted, the job fails before a trial starts.
+
+The trial's config holds only a ``${NAME}`` template; the token itself is in this process's environment under that
+name while the job runs, so it is never written to the job's files, whatever the agent calls its key variable.
 """
 
 from __future__ import annotations
@@ -14,6 +17,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
+import uuid
 from collections.abc import AsyncGenerator, Callable, Iterable
 from datetime import UTC, datetime
 
@@ -83,6 +88,7 @@ class TrialCredentialIssuer:
                 job.on_trial_cancelled(trials.cancelled)
                 yield
             finally:
+                trials.forget_tokens()
                 cleanup = asyncio.ensure_future(trials.revoke_all())
                 try:
                     await asyncio.shield(cleanup)
@@ -113,6 +119,7 @@ class _JobTrials:
         self._cancelled: set[str] = set()
         self._ends: dict[str, int] = {}
         self._started_at: dict[str, datetime] = {}
+        self._token_variables: list[str] = []
         self._key_requests = asyncio.Semaphore(MAX_CONCURRENT_KEY_REQUESTS)
 
     async def issue(self, configs: Iterable[TrialConfig], api_key_env: str, *, auth_enabled: bool) -> None:
@@ -146,7 +153,18 @@ class _JobTrials:
             ) from failures[0]
         for config, token in zip(configs, results, strict=True):
             assert isinstance(token, str)
-            config.agent = config.agent.model_copy(update={"env": {**config.agent.env, api_key_env: token}})
+            variable = f"NEMO_TRIAL_KEY_{uuid.uuid4().hex.upper()}"
+            os.environ[variable] = token
+            self._token_variables.append(variable)
+            config.agent = config.agent.model_copy(
+                update={"env": {**config.agent.env, api_key_env: f"${{{variable}}}"}}
+            )
+
+    def forget_tokens(self) -> None:
+        """Remove the trials' tokens from this process's environment."""
+        for variable in self._token_variables:
+            os.environ.pop(variable, None)
+        self._token_variables.clear()
 
     async def ended(self, event: TrialHookEvent) -> None:
         """Harbor ended an attempt at a trial: record the trial's root span, and revoke its key if it's done."""

@@ -8,10 +8,12 @@ import hashlib
 import importlib.metadata
 import os
 import platform
+import signal
 import socket
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Any, cast
 
@@ -28,7 +30,9 @@ from nhx_evals_sdk.agent_eval.runtimes.harbor.fabric_agent import (
     RELAY_CLI_RELEASES_URL,
     RELAY_OTLP_PORT,
     RELAY_TRACES_DIR,
+    DetachedHelper,
     NemoFabricAgent,
+    detached_start_command,
 )
 from nhx_evals_sdk.agent_eval.runtimes.harbor.fabric_installed_agent import FabricInstalledAgent
 from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import ExportTraceServiceRequest
@@ -332,3 +336,33 @@ def _read_all(sock: socket.socket) -> bytes:
     while chunk := sock.recv(4096):
         chunks.append(chunk)
     return b"".join(chunks)
+
+
+def test_each_helper_starts_detached_under_its_own_pid(tmp_path: Path) -> None:
+    """The pid file names the helper itself, so stopping it stops it, and the start returns at once."""
+    ready = tmp_path / "helper.ready"
+    helper = DetachedHelper(name="sleeper", command=f"sh -c 'touch {ready}; exec sleep 30'", ready=str(ready))
+
+    started = time.monotonic()
+    subprocess.run(["sh", "-c", detached_start_command([helper], str(tmp_path), str(tmp_path))], check=True, timeout=10)
+    assert time.monotonic() - started < 5
+
+    pid = int((tmp_path / "nemo-fabric-relay-sleeper.pid").read_text())
+    try:
+        assert (
+            "sleep" in subprocess.run(["ps", "-o", "command=", "-p", str(pid)], capture_output=True, text=True).stdout
+        )
+    finally:
+        os.kill(pid, signal.SIGTERM)
+
+
+def test_an_https_gateway_on_a_forwarded_host_stays_https(tmp_path: Path) -> None:
+    agent = _gateway_agent(tmp_path, f"http://helix.example{GATEWAY_PATH}")
+    agent.fabric_config.models["judge"] = agent.fabric_config.models["default"].model_copy(
+        update={"base_url": f"https://helix.example{GATEWAY_PATH}"}
+    )
+
+    models = agent._build_config().models
+
+    assert models["default"].base_url == f"http://127.0.0.1:14320{GATEWAY_PATH}"
+    assert models["judge"].base_url == f"https://helix.example{GATEWAY_PATH}"

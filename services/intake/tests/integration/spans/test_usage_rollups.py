@@ -489,6 +489,32 @@ def test_the_agents_counts_still_count_when_the_gateway_reports_no_usage(client:
     assert _trace(client, session_id)["input_tokens"] == 295
 
 
+def test_a_gateway_call_without_usage_leaves_the_agents_counts_for_the_whole_trace(
+    client: TestClient, make_otlp_request
+) -> None:
+    """Counting only the gateway's reported call would drop the other; counting both would double the first."""
+    session_id = "gateway-partial-linked"
+    spans = _trial_with_linked_gateway_calls(session_id)
+    del spans[-1]["attributes"]["gen_ai.usage.input_tokens"], spans[-1]["attributes"]["gen_ai.usage.output_tokens"]
+    _ingest(client, make_otlp_request, session_id=session_id, trace_id=_trace_id(23), spans=spans)
+
+    trace = _trace(client, session_id)
+    assert (trace["input_tokens"], trace["output_tokens"]) == (295, 30)
+
+
+def test_a_marked_trajectory_still_counts_when_the_gateway_missed_a_calls_usage(
+    client: TestClient, make_otlp_request
+) -> None:
+    session_id = "gateway-partial-marked"
+    trial, agent = _gateway_and_agent_traces(session_id, marked=True)
+    del trial[-1]["attributes"]["gen_ai.usage.input_tokens"], trial[-1]["attributes"]["gen_ai.usage.output_tokens"]
+    _ingest(client, make_otlp_request, session_id=session_id, trace_id=_trace_id(24), spans=trial)
+    _ingest(client, make_otlp_request, session_id=session_id, trace_id=_trace_id(25), spans=agent)
+
+    session = _session(client, session_id)
+    assert (session["input_tokens"], session["output_tokens"]) == (295, 30)
+
+
 def test_a_gateway_span_reporting_zero_tokens_still_wins(client: TestClient, make_otlp_request) -> None:
     """A stored 0 is a report: the provider billed nothing, so the agent's estimate doesn't stand in for it."""
     session_id = "gateway-zero"

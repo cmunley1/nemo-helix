@@ -35,6 +35,7 @@ import json
 import re
 import shlex
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
@@ -73,6 +74,41 @@ _HARBOR_EXTRA_HINT = (
     "NemoFabricAgent requires the Harbor optional dependency: install nemo-fabric[harbor] "
     "(the SDK's `harbor` extra) on Python 3.12 or later"
 )
+
+
+@dataclass(frozen=True)
+class DetachedHelper:
+    name: str
+    command: str
+    ready: str
+    """A file the helper writes once it is serving."""
+
+
+def detached_start_command(helpers: list[DetachedHelper], log_dir: str, pid_dir: str = "/tmp") -> str:
+    """A shell command that starts each helper detached and waits until every one is serving.
+
+    Each ``nohup … &`` is a statement of its own, so ``$!`` is the helper's own process, which the pid file then
+    names, and the shell keeps none of the helper's output open.
+    """
+    statements = []
+    for helper in helpers:
+        log = shlex.quote(f"{log_dir}/{helper.name}.log")
+        statements += [
+            f"rm -f {shlex.quote(helper.ready)}",
+            f"nohup {helper.command} > {log} 2>&1 < /dev/null &",
+            f"echo $! > {shlex.quote(f'{pid_dir}/nemo-fabric-relay-{helper.name}.pid')}",
+        ]
+    waits = " && ".join(f"[ -f {shlex.quote(helper.ready)} ]" for helper in helpers)
+    statements.append(f"for _ in $(seq 1 50); do {waits} && exit 0; sleep 0.1; done; exit 1")
+    return "\n".join(statements)
+
+
+def _plain_http_upstream(base_url: str) -> tuple[str, int] | None:
+    """The host and port of a plain-HTTP, non-loopback URL; ``None`` for any other."""
+    url = urlsplit(base_url)
+    if url.scheme != "http" or url.hostname is None or _is_loopback(url.hostname):
+        return None
+    return url.hostname, url.port or 80
 
 
 def _is_loopback(host: str) -> bool:
@@ -382,34 +418,28 @@ class NemoFabricAgent(FabricAgent):  # ty: ignore[unsupported-base]
             await super().run(instruction, environment, context)
             return
         python = shlex.quote(self._runner_python)
-        traces = shlex.quote(RELAY_TRACES_DIR)
         helpers = [
-            (
-                "otlp-receiver",
-                f"{shlex.quote(_RECEIVER_PATH)} {traces} {RELAY_OTLP_PORT}",
-                f"{RELAY_TRACES_DIR}/{otlp_receiver.READY_FILENAME}",
+            DetachedHelper(
+                name="otlp-receiver",
+                command=f"{python} {shlex.quote(_RECEIVER_PATH)} {shlex.quote(RELAY_TRACES_DIR)} {RELAY_OTLP_PORT}",
+                ready=f"{RELAY_TRACES_DIR}/{otlp_receiver.READY_FILENAME}",
             )
         ]
         for (host, port), local_port in self._gateway_forwards().items():
             ready = f"/tmp/nemo-fabric-forwarder-{local_port}.ready"
             helpers.append(
-                (
-                    f"forwarder-{local_port}",
-                    f"{shlex.quote(_FORWARDER_PATH)} {local_port} {shlex.quote(host)} {port} {shlex.quote(ready)}",
-                    ready,
+                DetachedHelper(
+                    name=f"forwarder-{local_port}",
+                    command=(
+                        f"{python} {shlex.quote(_FORWARDER_PATH)} {local_port} {shlex.quote(host)} {port} "
+                        f"{shlex.quote(ready)}"
+                    ),
+                    ready=ready,
                 )
             )
-        # Started detached, so they outlive this exec and serve Relay for the whole run.
-        start = [f"mkdir -p {traces}"]
-        for name, arguments, ready in helpers:
-            start += [
-                f"rm -f {shlex.quote(ready)}",
-                f"nohup {python} {arguments} > {shlex.quote(f'{CONTAINER_LOGS_DIR}/{name}.log')} 2>&1 < /dev/null & "
-                f"echo $! > /tmp/nemo-fabric-relay-{name}.pid",
-            ]
-        waits = " && ".join(f"[ -f {shlex.quote(ready)} ]" for _, _, ready in helpers)
         result = await environment.exec(
-            " && ".join(start) + f"; for _ in $(seq 1 50); do {waits} && exit 0; sleep 0.1; done; exit 1",
+            f"mkdir -p {shlex.quote(RELAY_TRACES_DIR)} || exit 1\n"
+            + detached_start_command(helpers, CONTAINER_LOGS_DIR),
             timeout_sec=30,
         )
         ensure_success("The helpers Relay needs beside the harness did not start", result)
@@ -417,7 +447,7 @@ class NemoFabricAgent(FabricAgent):  # ty: ignore[unsupported-base]
             await super().run(instruction, environment, context)
         finally:
             await environment.exec(
-                f"for pid in {_RELAY_PID_GLOB}; do kill $(cat $pid) 2>/dev/null; done; true", timeout_sec=30
+                f"for pid in {_RELAY_PID_GLOB}; do kill $(cat $pid) 2>/dev/null; rm -f $pid; done; true", timeout_sec=30
             )
 
     def populate_context_post_run(self, context: Any) -> None:
@@ -433,9 +463,8 @@ class NemoFabricAgent(FabricAgent):  # ty: ignore[unsupported-base]
         for model in self.fabric_config.models.values():
             if not model.base_url or PLATFORM_GATEWAY_PATH_MARKER not in model.base_url:
                 continue
-            url = urlsplit(model.base_url)
-            if url.scheme == "http" and url.hostname is not None and not _is_loopback(url.hostname):
-                upstreams.add((url.hostname, url.port or 80))
+            if (upstream := _plain_http_upstream(model.base_url)) is not None:
+                upstreams.add(upstream)
         return {upstream: RELAY_GATEWAY_FORWARD_PORT + index for index, upstream in enumerate(sorted(upstreams))}
 
     @property
@@ -482,9 +511,9 @@ class NemoFabricAgent(FabricAgent):  # ty: ignore[unsupported-base]
                 # A key Harbor hands the agent (a trial's own gateway key) must not be shadowed by the placeholder.
                 if model.api_key_env not in self._extra_env:
                     environment.env.setdefault(model.api_key_env, PLATFORM_GATEWAY_API_KEY_PLACEHOLDER)
-                url = urlsplit(model.base_url)
-                if (local_port := forwards.get((url.hostname or "", url.port or 80))) is not None:
-                    model.base_url = urlunsplit(url._replace(netloc=f"127.0.0.1:{local_port}"))
+                upstream = _plain_http_upstream(model.base_url)
+                if upstream is not None and (local_port := forwards.get(upstream)) is not None:
+                    model.base_url = urlunsplit(urlsplit(model.base_url)._replace(netloc=f"127.0.0.1:{local_port}"))
 
         if self.model_name:
             default = config.models.get("default")

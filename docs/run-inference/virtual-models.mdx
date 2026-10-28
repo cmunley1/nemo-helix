@@ -363,7 +363,8 @@ caller's span instead. The session, evaluation and test case still come from the
 from headers.
 
 Intake counts each call's usage once. In a trace that holds gateway call spans, their usage replaces
-the agent's own spans for the same calls. When the agent's trace is separate, the evaluation marks
+the agent's own spans for the same calls, as long as every gateway span in the trace recorded usage;
+if one didn't, the trace counts the agent's own numbers instead. When the agent's trace is separate, the evaluation marks
 the published trace as superseded, so the session counts the gateway's usage. The agent's own totals
 stay on its trace for inspection, and a metric the gateway doesn't report, such as cost, still counts
 from it.
