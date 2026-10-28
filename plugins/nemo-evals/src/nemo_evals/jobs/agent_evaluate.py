@@ -617,11 +617,12 @@ class _AgentEvalJobBase(NemoJob):
         ]
         self._prepared_tasks(tasks)
         run_id = self._run_id() or f"agent-eval-{datetime.now(UTC):%Y%m%d%H%M%S}-{uuid.uuid4().hex[:8]}"
+        trial_issuer = _trial_credential_issuer(spec, ctx, platform_client, async_client, run_id)
         target, prompt_template, params = self._resolve_target(
             spec.target,
             ctx,
             configure_harbor=lambda harbor_config: self._configure_harbor_runtime(harbor_config, ctx),
-            trial_issuer=_trial_credential_issuer(spec, ctx, platform_client, async_client, run_id),
+            trial_issuer=trial_issuer,
         )
         bundle_dir = ctx.storage.persistent / AGENT_BUNDLE_DIR
         if bundle_dir.exists():
@@ -693,6 +694,7 @@ class _AgentEvalJobBase(NemoJob):
                 workspace=ctx.workspace,
                 intake=intake,
                 record_durations=self.record_publication_durations,
+                usage_superseded_by_gateway=trial_issuer is not None and trial_issuer.records_calls,
             )
             output["publication"] = publication_outcome.model_dump(exclude_none=True)
             # The job output isn't persisted; status details are, so `runs status` can say what was published.
@@ -738,12 +740,14 @@ def _trial_credential_issuer(
     if async_client is None or not isinstance(target, HarborRunnerTarget) or target.gateway_model is None:
         return None
     publication = spec.publication.intake if spec.publication is not None else None
+    route = check_trial_route(platform_client, target.gateway_model)
     return TrialCredentialIssuer(
         async_client,
         run_id=run_id,
         intake_workspace=ctx.workspace,
         evaluation_name=publication.evaluation_id if publication is not None else None,
-        model_access=check_trial_route(platform_client, target.gateway_model),
+        model_access=route.model_access,
+        records_calls=route.records_calls,
     )
 
 

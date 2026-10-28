@@ -24,7 +24,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
 
-from nemo_evals.trial_spans import call_span, export_request
+from nemo_evals.trial_spans import CallerSpan, call_span, export_request
 from nemo_evals.trial_tokens import TrialTokenReader, claims_a_trial
 from nemo_helix_plugin.auth import platform_auth_enabled, verified_access_key_claims
 from nemo_helix_plugin.client.client import AsyncNemoClient
@@ -178,6 +178,7 @@ class FinishedCall:
     ended_at: datetime
     cancelled: bool
     attributes: Mapping[str, object] = field(default_factory=dict)
+    caller: CallerSpan | None = None
 
 
 SpanSink = Callable[[str, list[ResourceSpans]], Awaitable[int]]
@@ -305,6 +306,7 @@ class CallRecorder:
             ended_at=call.ended_at,
             error=False,
             attributes=attributes,
+            caller=call.caller,
         )
         return trial.intake_workspace, span
 
@@ -377,6 +379,7 @@ class _ObservedCall:
         self.agent_headers = {
             name: value[:MAX_HEADER_VALUE_LENGTH] for name in AGENT_HEADERS if (value := request.headers.get(name))
         }
+        self.caller = CallerSpan.from_headers(request.headers.get("traceparent"), request.headers.get("tracestate"))
 
     def observe(self, payload: object) -> None:
         if isinstance(payload, Mapping) and (usage := usage_from_payload(self.api, payload)) is not None:
@@ -401,6 +404,7 @@ class _ObservedCall:
             ended_at=datetime.now(UTC),
             cancelled=cancelled,
             attributes=attributes,
+            caller=self.caller,
         )
 
 

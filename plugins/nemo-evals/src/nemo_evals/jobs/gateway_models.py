@@ -8,7 +8,7 @@ from __future__ import annotations
 import ipaddress
 import logging
 from collections.abc import Iterable, Mapping, Sequence
-from typing import Any
+from typing import Any, NamedTuple
 from urllib.parse import urlsplit, urlunsplit
 
 from harbor.models.task.config import NetworkMode, TaskConfig
@@ -281,11 +281,17 @@ def trial_recording_gap(virtual_model: VirtualModel) -> str | None:
     return None
 
 
-def check_trial_route(client: NemoClient | AsyncNemoClient, gateway_model: ModelRef) -> ModelAccess:
-    """The model access the gateway model's route gives trials, warning when it won't record their calls.
+class TrialRoute(NamedTuple):
+    model_access: ModelAccess
+    records_calls: bool
 
-    The route is closed-book when its VirtualModel ends its request middleware with the closed-book middleware;
-    anything else, including a VirtualModel that can't be read, is open.
+
+def check_trial_route(client: NemoClient | AsyncNemoClient, gateway_model: ModelRef) -> TrialRoute:
+    """What the gateway model's route gives trials, warning when it won't record their calls.
+
+    The route is closed-book when its VirtualModel ends its request middleware with the closed-book middleware, and
+    records calls when it lists the trial-recording middleware in its response middleware. A VirtualModel that can't
+    be read is open and records nothing.
     """
     workspace, name = parse_workspace_name_ref(gateway_model.root, label="Gateway model")
 
@@ -306,7 +312,10 @@ def check_trial_route(client: NemoClient | AsyncNemoClient, gateway_model: Model
             gateway_model.root,
             e,
         )
-        return ModelAccess.OPEN
+        return TrialRoute(ModelAccess.OPEN, records_calls=False)
     if (gap := trial_recording_gap(virtual_model)) is not None:
         logger.warning("Virtual model %s: %s", gateway_model.root, gap)
-    return ModelAccess.CLOSED if is_closed_book_route(virtual_model) else ModelAccess.OPEN
+    return TrialRoute(
+        ModelAccess.CLOSED if is_closed_book_route(virtual_model) else ModelAccess.OPEN,
+        records_calls=any(call.name == MIDDLEWARE_NAME for call in virtual_model.response_middleware),
+    )

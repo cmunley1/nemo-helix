@@ -54,7 +54,9 @@ class TrialCredentialIssuer:
         intake_workspace: str,
         evaluation_name: str | None = None,
         model_access: ModelAccess = ModelAccess.OPEN,
+        records_calls: bool = False,
     ) -> None:
+        self.records_calls = records_calls
         self._client = client
         self._run_id = run_id
         self._intake_workspace = intake_workspace

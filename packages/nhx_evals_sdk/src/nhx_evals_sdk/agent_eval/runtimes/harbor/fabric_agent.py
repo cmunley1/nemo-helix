@@ -42,11 +42,18 @@ from nemo_fabric import (
     EnvironmentConfig,
     FabricConfig,
     FabricConfigError,
+    RelayAtifConfig,
+    RelayAtofConfig,
     RelayAtofFileSinkConfig,
+    RelayObservabilityConfig,
+    RelayOpenTelemetryConfig,
+    RelayOpenTelemetryEndpointConfig,
     inspect_adapter,
 )
-from nemo_fabric.integrations.harbor.fabric_agent import HARBOR_ARTIFACT_ROOT, FabricAgent
+from nemo_fabric.integrations.harbor.fabric_agent import HARBOR_ARTIFACT_ROOT, FabricAgent, ensure_success
+from nhx_evals_sdk.agent_eval.runtimes.fabric import otlp_receiver
 from nhx_evals_sdk.agent_eval.runtimes.fabric.image import fabric_version
+from nhx_evals_sdk.agent_eval.runtimes.fabric.otlp_writer import TRACES_SUBDIR, fold_exports, otlp_endpoint_fields
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 try:
@@ -109,6 +116,43 @@ _CLAUDE_UNATTENDED_SETTINGS = {"permission_mode": "bypassPermissions"}
 PLATFORM_GATEWAY_PATH_MARKER = "/apis/inference-gateway/"
 PLATFORM_GATEWAY_API_KEY_ENV = "NEMO_AGENTS_IGW_API_KEY"
 PLATFORM_GATEWAY_API_KEY_PLACEHOLDER = "not-used"
+
+#: Where Relay's OTel export goes: a receiver beside the harness writes each export under the agent's
+#: logs, which Harbor brings back with the trial, and they are folded into ``traces/relay.jsonl`` there.
+CONTAINER_LOGS_DIR = "/logs/agent"
+RELAY_TRACES_DIR = f"{CONTAINER_LOGS_DIR}/{TRACES_SUBDIR}"
+RELAY_OTLP_PORT = 14318
+_RECEIVER_PATH = "/tmp/nemo-fabric-otlp-receiver.py"
+_RECEIVER_PID_PATH = "/tmp/nemo-fabric-otlp-receiver.pid"
+
+#: Relay's Codex and Claude adapters launch the ``nemo-relay`` CLI, which the ``nemo-relay`` wheel
+#: doesn't ship; setup installs the release matching the installed bindings unless one is on PATH.
+#: Downloading it needs ``github.com`` and ``release-assets.githubusercontent.com`` during setup.
+RELAY_CLI_RELEASES_URL = "https://github.com/NVIDIA/NeMo-Relay/releases/download"
+RELAY_CLI_DIR = "/tmp/nemo-relay/bin"
+_RELAY_CLI_INSTALL = """
+import hashlib, importlib.metadata, os, platform, shutil, sys, urllib.request
+if shutil.which("nemo-relay"):
+    sys.exit(0)
+try:
+    version = importlib.metadata.version("nemo-relay")
+except importlib.metadata.PackageNotFoundError:
+    sys.exit("Relay telemetry needs the nemo-relay Python package: install nemo-fabric[relay]")
+arch = {"x86_64": "x86_64", "amd64": "x86_64", "aarch64": "aarch64", "arm64": "aarch64"}.get(platform.machine().lower())
+if arch is None:
+    sys.exit(f"no nemo-relay CLI release for {platform.machine()}")
+asset = f"nemo-relay-cli-{arch}-unknown-linux-musl-{version}"
+url = f"{sys.argv[1]}/{version}/{asset}"
+binary = urllib.request.urlopen(url, timeout=120).read()
+expected = urllib.request.urlopen(url + ".sha256", timeout=60).read().decode().split()[0]
+if hashlib.sha256(binary).hexdigest() != expected:
+    sys.exit(f"{asset} does not match its published sha256")
+os.makedirs(sys.argv[2], exist_ok=True)
+target = os.path.join(sys.argv[2], "nemo-relay")
+with open(target, "wb") as handle:
+    handle.write(binary)
+os.chmod(target, 0o755)
+"""
 
 #: An exact ``nemo-fabric`` pin inside ``fabric_package``, with or without extras.
 _FABRIC_DISTRIBUTION_PIN = re.compile(
@@ -293,6 +337,58 @@ class NemoFabricAgent(FabricAgent):  # ty: ignore[unsupported-base]
     def name() -> str:
         return "nemo-fabric"
 
+    async def setup(self, environment: Any) -> None:
+        await super().setup(environment)
+        await self.prepare_relay(environment)
+
+    async def prepare_relay(self, environment: Any) -> None:
+        """Install what capturing Relay's traces needs in the container; nothing when the config has no Relay."""
+        if self.fabric_config.relay is None:
+            return
+        receiver = Path(self.logs_dir) / "otlp-receiver.py"
+        receiver.write_text(Path(otlp_receiver.__file__).read_text(encoding="utf-8"), encoding="utf-8")
+        await environment.upload_file(receiver, _RECEIVER_PATH)
+        result = await environment.exec(
+            f"{shlex.quote(self._runner_python)} -c {shlex.quote(_RELAY_CLI_INSTALL)} "
+            f"{shlex.quote(RELAY_CLI_RELEASES_URL)} {shlex.quote(RELAY_CLI_DIR)}",
+            env=self._install_env,
+            timeout_sec=self.fabric_timeout_sec,
+        )
+        ensure_success("Installing the nemo-relay CLI failed", result)
+
+    async def run(self, instruction: str, environment: Any, context: Any) -> None:
+        if self.fabric_config.relay is None:
+            await super().run(instruction, environment, context)
+            return
+        traces = shlex.quote(RELAY_TRACES_DIR)
+        ready = shlex.quote(f"{RELAY_TRACES_DIR}/{otlp_receiver.READY_FILENAME}")
+        # Started detached, so it outlives this exec and listens while Relay exports during the run.
+        result = await environment.exec(
+            f"mkdir -p {traces} && rm -f {ready} && "
+            f"nohup {shlex.quote(self._runner_python)} {shlex.quote(_RECEIVER_PATH)} {traces} {RELAY_OTLP_PORT} "
+            f"> {shlex.quote(f'{CONTAINER_LOGS_DIR}/otlp-receiver.log')} 2>&1 < /dev/null & "
+            f"echo $! > {shlex.quote(_RECEIVER_PID_PATH)}; "
+            f"for _ in $(seq 1 50); do [ -f {ready} ] && exit 0; sleep 0.1; done; exit 1",
+            timeout_sec=30,
+        )
+        ensure_success("The OTLP receiver for Relay's traces did not start", result)
+        try:
+            await super().run(instruction, environment, context)
+        finally:
+            await environment.exec(f"kill $(cat {shlex.quote(_RECEIVER_PID_PATH)}) 2>/dev/null; true", timeout_sec=30)
+
+    def populate_context_post_run(self, context: Any) -> None:
+        super().populate_context_post_run(context)
+        if self.fabric_config.relay is not None:
+            fold_exports(Path(self.logs_dir) / TRACES_SUBDIR)
+
+    @property
+    def _runner_path_prefix(self) -> str | None:
+        prefix = super()._runner_path_prefix
+        if self.fabric_config.relay is None:
+            return prefix
+        return RELAY_CLI_DIR if prefix is None else f"{RELAY_CLI_DIR}:{prefix}"
+
     def _build_config(self) -> FabricConfig:
         """The supplied config, with only the per-trial mechanics Harbor owns written over it."""
         config = self.fabric_config.model_copy(deep=True)
@@ -340,14 +436,25 @@ class NemoFabricAgent(FabricAgent):  # ty: ignore[unsupported-base]
         if config.relay is not None:
             relay_output = f"{artifact_root}/relay"
             config.relay.output_dir = relay_output
-            observability = config.relay.observability
-            if observability is not None:
-                if observability.atif is not None:
-                    observability.atif.output_directory = relay_output
-                if observability.atof is not None:
-                    for sink in observability.atof.sinks:
-                        if isinstance(sink, RelayAtofFileSinkConfig):
-                            sink.output_directory = relay_output
+            observability = config.relay.observability or RelayObservabilityConfig()
+            config.relay.observability = observability
+            receiver = RelayOpenTelemetryEndpointConfig(
+                **otlp_endpoint_fields(
+                    endpoint=f"http://127.0.0.1:{RELAY_OTLP_PORT}{otlp_receiver.TRACES_PATH}",
+                    service_name=config.metadata.name,
+                )
+            )
+            existing = observability.opentelemetry
+            observability.opentelemetry = RelayOpenTelemetryConfig(
+                enabled=True,
+                endpoints=[*(existing.endpoints if existing is not None and existing.enabled else []), receiver],
+            )
+            if isinstance(observability.atif, RelayAtifConfig):
+                observability.atif.output_directory = relay_output
+            if isinstance(observability.atof, RelayAtofConfig):
+                for sink in observability.atof.sinks or ():
+                    if isinstance(sink, RelayAtofFileSinkConfig):
+                        sink.output_directory = relay_output
 
         for server in self.mcp_servers:
             if server.transport == "stdio":

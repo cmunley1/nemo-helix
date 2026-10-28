@@ -18,6 +18,8 @@ from decimal import Decimal, InvalidOperation
 from enum import Enum, StrEnum
 from typing import Any
 
+from nemo_helix_plugin.intake.span_attributes import GATEWAY_CALL_ATTRIBUTE, USAGE_SUPERSEDED_ATTRIBUTE
+
 
 # Storage bag names: the three ClickHouse Map columns used for span attributes.
 class AttributeBag(StrEnum):
@@ -51,6 +53,8 @@ class SpanAttributeField(StrEnum):
     COST_TOTAL_USD = "cost_total_usd"
     COST_INPUT_USD = "cost_input_usd"
     COST_OUTPUT_USD = "cost_output_usd"
+    GATEWAY_CALL = "gateway_call"
+    USAGE_SUPERSEDED_BY_GATEWAY = "usage_superseded_by_gateway"
 
 
 # Catalog entry: source aliases -> typed semantic field -> canonical storage bag/key.
@@ -263,6 +267,18 @@ ATTRIBUTE_SPECS = (
         bag_key="cost.output",
         source_keys=("llm.cost.completion",),
         scale=COST_SCALE,
+    ),
+    AttributeSpec(
+        field=SpanAttributeField.GATEWAY_CALL,
+        bag=AttributeBag.BOOL,
+        bag_key=GATEWAY_CALL_ATTRIBUTE,
+        source_keys=(GATEWAY_CALL_ATTRIBUTE,),
+    ),
+    AttributeSpec(
+        field=SpanAttributeField.USAGE_SUPERSEDED_BY_GATEWAY,
+        bag=AttributeBag.BOOL,
+        bag_key=USAGE_SUPERSEDED_ATTRIBUTE,
+        source_keys=(USAGE_SUPERSEDED_ATTRIBUTE,),
     ),
 )
 

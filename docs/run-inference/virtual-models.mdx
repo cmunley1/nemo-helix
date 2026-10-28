@@ -357,6 +357,16 @@ the provider reported. It doesn't change, delay or fail the
 call, and calls made with any other credential aren't recorded. With platform auth on, it trusts
 only trial tokens the platform signed.
 
+When a call carries a valid W3C `traceparent`, its span goes into the caller's trace beneath the
+caller's span instead. The session, evaluation and test case still come from the trial token, never
+from headers.
+
+Intake counts each call's usage once. In a trace that holds gateway call spans, their usage replaces
+the agent's own spans for the same calls. When the agent's trace is separate, the evaluation marks
+the published trace as superseded, so the session counts the gateway's usage. The agent's own totals
+stay on its trace for inspection, and a metric the gateway doesn't report, such as cost, still counts
+from it.
+
 It takes no settings. Add it to `request_middleware`, so a call's span starts when the call arrives,
 and to `response_middleware`, where each call is recorded:
 

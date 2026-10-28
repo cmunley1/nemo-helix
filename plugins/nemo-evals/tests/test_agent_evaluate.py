@@ -567,6 +567,35 @@ def test_agent_eval_job_passes_async_client_to_publication(tmp_path: Path, mocke
     assert intake.default_headers == _SDK_IDENTITY_HEADERS
 
 
+@pytest.mark.parametrize(
+    ("issuer", "marked"),
+    [
+        pytest.param(SimpleNamespace(records_calls=True), True, id="the route records the trials' calls"),
+        pytest.param(SimpleNamespace(records_calls=False), False, id="the route doesn't record them"),
+        pytest.param(None, False, id="no trial tokens"),
+    ],
+)
+def test_agent_eval_job_marks_published_usage_as_superseded_when_the_gateway_recorded_it(
+    tmp_path: Path, mocker: MockerFixture, issuer: SimpleNamespace | None, marked: bool
+) -> None:
+    mocker.patch.object(AgentEvalJob, "_build_evaluator", return_value=_FakeEvaluator())
+    mocker.patch("nemo_evals.jobs.agent_evaluate.persist_agent_eval_result")
+    mocker.patch("nemo_evals.jobs.agent_evaluate._trial_credential_issuer", return_value=issuer)
+    publish = mocker.patch(
+        "nemo_evals.jobs.agent_evaluate.publish_agent_eval_result",
+        return_value=PublicationOutcome(status=HelixJobStatus.COMPLETED, evaluation_id="eval-a"),
+    )
+    spec = AgentEvalSpec(
+        tasks=[_task_spec()],
+        target=_runner_target("openai/gpt-5.4"),
+        publication=PublicationSpec(intake=IntakePublicationSpec(evaluation_id="eval-a", agent_name="agent-a")),
+    )
+
+    AgentEvalJob().run(spec.model_dump(), ctx=_job_context(tmp_path), client=_sync_sdk_with_identity())
+
+    assert publish.call_args.kwargs["usage_superseded_by_gateway"] is marked
+
+
 def test_agent_eval_job_records_the_publish_outcome_in_status_details(tmp_path: Path, mocker: MockerFixture) -> None:
     """The job's output isn't persisted, so `runs status` reads the publish outcome from status details."""
     mocker.patch.object(AgentEvalJob, "_build_evaluator", return_value=_FakeEvaluator())

@@ -25,7 +25,13 @@ from nemo_evals.trial_recording import (
     caller_credential,
     usage_from_payload,
 )
-from nemo_evals.trial_spans import GATEWAY_CALL_ATTRIBUTE, SESSION_ATTRIBUTE, TEST_CASE_ATTRIBUTE
+from nemo_evals.trial_spans import (
+    GATEWAY_CALL_ATTRIBUTE,
+    MAX_TRACESTATE_LENGTH,
+    SESSION_ATTRIBUTE,
+    TEST_CASE_ATTRIBUTE,
+    CallerSpan,
+)
 from nemo_evals.trial_tokens import ModelAccess, TrialClaims, TrialPolicy, TrialTokenReader, unsigned_trial_token
 from nemo_helix_plugin.client.oidc import decode_jwt_claims
 from nemo_helix_plugin.inference_middleware import InferenceMiddlewareContext, InferenceRequest, InferenceResponse
@@ -195,6 +201,66 @@ async def test_a_call_made_with_a_trial_token_is_recorded_in_the_trial() -> None
     assert attributes["gen_ai.usage.output_tokens"] == 5
     assert attributes["gen_ai.request.model"] == "meta/llama-3.3-70b"
     assert attributes["nemo.virtual_model"] == "models/agent-model"
+
+
+CALLER_TRACE = "01a182ecbd457d118e02830498804285"
+CALLER_SPAN = "9fe2c6bed0c1c48c"
+
+
+async def test_a_call_that_sends_a_traceparent_is_recorded_under_the_callers_span() -> None:
+    """An agent tracing its own model calls gets the gateway's span in its trace, as that call's child."""
+    sink = Sink()
+    middleware = _middleware(_reader(TOKEN), sink)
+    headers = {
+        "authorization": f"Bearer {TOKEN}",
+        "traceparent": f"00-{CALLER_TRACE}-{CALLER_SPAN}-01",
+        "tracestate": "relay=1",
+    }
+
+    await _call(middleware, _ctx(headers), {"usage": {"prompt_tokens": 1}})
+    assert middleware._recorder is not None
+    await middleware._recorder.flush()
+
+    [(workspace, span)] = _spans(sink.sent)
+    assert (span.trace_id.hex(), span.parent_span_id.hex(), span.trace_state) == (CALLER_TRACE, CALLER_SPAN, "relay=1")
+    assert workspace == "evals"
+    assert _attributes(span)[SESSION_ATTRIBUTE] == TRIAL.session
+
+
+@pytest.mark.parametrize(
+    "traceparent",
+    [
+        pytest.param(f"00-{CALLER_TRACE}-{CALLER_SPAN}", id="missing flags"),
+        pytest.param(f"00-{'0' * 32}-{CALLER_SPAN}-01", id="zero trace id"),
+        pytest.param(f"00-{CALLER_TRACE}-{'0' * 16}-01", id="zero span id"),
+        pytest.param(f"ff-{CALLER_TRACE}-{CALLER_SPAN}-01", id="invalid version"),
+        pytest.param(f"00-{CALLER_TRACE}-{CALLER_SPAN}-01-extra", id="version 00 with extra fields"),
+        pytest.param(f"00-{CALLER_TRACE.upper()}-{CALLER_SPAN}-01", id="uppercase"),
+        pytest.param("not-a-traceparent", id="garbage"),
+    ],
+)
+async def test_a_call_with_an_invalid_traceparent_is_recorded_in_the_trial_trace(traceparent: str) -> None:
+    sink = Sink()
+    middleware = _middleware(_reader(TOKEN), sink)
+
+    await _call(middleware, _ctx({"authorization": f"Bearer {TOKEN}", "traceparent": traceparent}), {})
+    assert middleware._recorder is not None
+    await middleware._recorder.flush()
+
+    [(_, span)] = _spans(sink.sent)
+    assert (span.trace_id.hex(), span.parent_span_id.hex()) == (TRIAL.trace_id, TRIAL.root_span_id)
+
+
+def test_a_future_traceparent_version_is_read_by_its_version_00_fields() -> None:
+    caller = CallerSpan.from_headers(f"01-{CALLER_TRACE}-{CALLER_SPAN}-01-future")
+
+    assert caller == CallerSpan(CALLER_TRACE, CALLER_SPAN)
+
+
+def test_an_oversized_tracestate_is_left_off() -> None:
+    caller = CallerSpan.from_headers(f"00-{CALLER_TRACE}-{CALLER_SPAN}-01", "a=" + "b" * MAX_TRACESTATE_LENGTH)
+
+    assert caller == CallerSpan(CALLER_TRACE, CALLER_SPAN)
 
 
 @pytest.mark.parametrize(

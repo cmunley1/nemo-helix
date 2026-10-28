@@ -146,6 +146,7 @@ async def publish_to_intake(
     agent_version: str = mapping.DEFAULT_AGENT_VERSION,
     model_name: str | None = None,
     max_concurrency: int = DEFAULT_MAX_CONCURRENCY,
+    usage_superseded_by_gateway: bool = False,
 ) -> PublishReport:
     """Publish a completed ``AgentEvalResult`` to Intake under an existing Experiment.
 
@@ -166,6 +167,9 @@ async def publish_to_intake(
     a function of the result, not of when it was published. Re-sending a trial that
     already landed replaces its rows instead of duplicating them, which is what makes
     a worker retry after a partial publish safe.
+
+    ``usage_superseded_by_gateway`` marks each published trace as one whose model calls the Inference Gateway
+    recorded in the trial's session, so Intake counts the gateway's usage for them instead.
 
     ``experiment_id`` must reference an evaluation that already exists and is not
     deleted; it is checked once up front. ATIF ingest enforces this server-side, but
@@ -220,6 +224,7 @@ async def publish_to_intake(
             evaluation_name=experiment_id,
             measurements=measurements,
             started_at=started_at,
+            usage_superseded=usage_superseded_by_gateway,
         )
         if otlp is None:
             return None
@@ -255,6 +260,7 @@ async def publish_to_intake(
                 final_metrics=_token_final_metrics(measurements),
                 ended_at=ended_at,
                 steps=steps,
+                usage_superseded=usage_superseded_by_gateway,
             )
             body["workspace"] = resolved_workspace
             return body

@@ -7,10 +7,13 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from datetime import datetime
 
 from nemo_evals.trial_tokens import TrialClaims
+from nemo_helix_plugin.intake.span_attributes import GATEWAY_CALL_ATTRIBUTE
 from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import ExportTraceServiceRequest
 from opentelemetry.proto.common.v1.common_pb2 import AnyValue, ArrayValue, InstrumentationScope, KeyValue
 from opentelemetry.proto.resource.v1.resource_pb2 import Resource
@@ -20,8 +23,6 @@ SERVICE_NAME = "nemo-evals"
 SESSION_ATTRIBUTE = "gen_ai.conversation.id"
 EVALUATION_ATTRIBUTE = "nemo.evaluation.name"
 TEST_CASE_ATTRIBUTE = "nemo.test_case.name"
-# Marks a call span recorded by the gateway, whose usage is what the provider reported for the call.
-GATEWAY_CALL_ATTRIBUTE = "nemo.inference_gateway.call"
 
 _SCOPE = InstrumentationScope(name="nemo_evals.trial_spans")
 
@@ -65,6 +66,31 @@ def export_request(batch: Iterable[ResourceSpans]) -> bytes:
     return ExportTraceServiceRequest(resource_spans=list(batch)).SerializeToString()
 
 
+_TRACEPARENT = re.compile(r"([0-9a-f]{2})-([0-9a-f]{32})-([0-9a-f]{16})-[0-9a-f]{2}(-.*)?")
+MAX_TRACESTATE_LENGTH = 512
+
+
+@dataclass(frozen=True)
+class CallerSpan:
+    """The span a caller made its model call in, from the W3C ``traceparent`` it sent."""
+
+    trace_id: str
+    span_id: str
+    trace_state: str = ""
+
+    @classmethod
+    def from_headers(cls, traceparent: str | None, tracestate: str | None = None) -> CallerSpan | None:
+        """The caller's span, or ``None`` when ``traceparent`` is missing or isn't a valid W3C value."""
+        match = _TRACEPARENT.fullmatch((traceparent or "").strip())
+        if match is None:
+            return None
+        version, trace_id, span_id, rest = match.groups()
+        if version == "ff" or (version == "00" and rest) or set(trace_id) == {"0"} or set(span_id) == {"0"}:
+            return None
+        state = (tracestate or "").strip()
+        return cls(trace_id, span_id, state if len(state) <= MAX_TRACESTATE_LENGTH else "")
+
+
 def call_span(
     trial: TrialClaims,
     *,
@@ -73,12 +99,14 @@ def call_span(
     ended_at: datetime,
     error: bool,
     attributes: Mapping[str, object],
+    caller: CallerSpan | None = None,
 ) -> ResourceSpans:
-    """One model call the gateway served the trial, as a child of the trial's root."""
+    """One model call the gateway served the trial: a child of the caller's span, else of the trial's root."""
     span = Span(
-        trace_id=bytes.fromhex(trial.trace_id),
+        trace_id=bytes.fromhex(caller.trace_id if caller is not None else trial.trace_id),
         span_id=os.urandom(8),
-        parent_span_id=bytes.fromhex(trial.root_span_id),
+        parent_span_id=bytes.fromhex(caller.span_id if caller is not None else trial.root_span_id),
+        trace_state=caller.trace_state if caller is not None else "",
         name=name,
         kind=Span.SPAN_KIND_SERVER,
         start_time_unix_nano=_nanos(started_at),

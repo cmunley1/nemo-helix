@@ -45,6 +45,8 @@ class SpanSemanticAttributes(BaseModel):
     cost_total_usd: Decimal | None = None
     cost_input_usd: Decimal | None = None
     cost_output_usd: Decimal | None = None
+    gateway_call: bool | None = None
+    usage_superseded_by_gateway: bool | None = None
 
     @classmethod
     def from_source_attributes(cls, attributes: Mapping[str, Any]) -> tuple[Self, set[str]]:
