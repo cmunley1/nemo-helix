@@ -778,8 +778,8 @@ An agent that declares no model connection, or a provider the gateway doesn't se
   runs the `nemo-evals-trial-recording` middleware reads the token to record the trial's model calls
   in Intake; see
   [Record Evaluation Trials](/documentation/models-and-inference/virtual-models#record-evaluation-trials).
-- With platform authentication enabled, `claude-code` can't call the gateway yet, so its target is
-  refused: it sends its key as `x-api-key`, and the gateway accepts only bearer tokens.
+- With platform authentication enabled, `claude-code` sends its access key as `x-api-key`, which
+  the gateway accepts on model routes like a bearer token.
 
 Every model call then reaches the provider without hosted tools. A model or provider that cannot be
 served closed-book fails the call with `403`.

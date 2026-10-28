@@ -248,16 +248,23 @@ async def test_check_refuses_auth_on_without_a_platform_key(monkeypatch: pytest.
         await check_gateway_model(_codex(), async_sdk=AsyncMock(), authorize=None)
 
 
-async def test_check_refuses_an_anthropic_style_agent_with_auth_on(monkeypatch: pytest.MonkeyPatch) -> None:
-    """It sends its key as `x-api-key`, which the gateway rejects, so the run would fail on every model call."""
+async def test_check_accepts_an_anthropic_style_agent_with_auth_on(
+    mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """It sends its key as `x-api-key`, which the gateway accepts on model routes."""
     monkeypatch.setattr(gateway_models, "platform_auth_enabled", lambda: True)
+    mocker.patch.object(gateway_models, "client_from_platform")
+    resolve = mocker.patch.object(
+        gateway_models.HelixMetricModelResolver, "resolve_model", AsyncMock(return_value=Model(url="u", name="n"))
+    )
     target = HarborRunnerTarget(
         source=_gateway_source("claude-code"),
         env_secrets={"ANTHROPIC_API_KEY": SecretRef("ws/agent-access-key")},
     )
 
-    with pytest.raises(ValueError, match="sends its key as `x-api-key`"):
-        await check_gateway_model(target, async_sdk=AsyncMock(), authorize=None)
+    await check_gateway_model(target, async_sdk=AsyncMock(), authorize=None)
+
+    resolve.assert_awaited_once()
 
 
 async def test_check_resolves_the_model_as_the_caller(mocker: MockerFixture, monkeypatch: pytest.MonkeyPatch) -> None:

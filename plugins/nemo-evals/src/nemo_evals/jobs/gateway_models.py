@@ -52,18 +52,13 @@ async def check_gateway_model(
     """Refuse a Harbor target whose gateway model is missing, unreadable by the caller, or uncallable.
 
     Raises:
-        ValueError: No model or VirtualModel has the name, or platform auth is on and the agent can't
-            authenticate to the gateway.
+        ValueError: No model or VirtualModel has the name, or platform auth is on and the agent has no key for
+            the gateway.
     """
     if not isinstance(target, HarborRunnerTarget) or target.gateway_model is None:
         return
     env = target.gateway_agent_env
     assert env is not None
-    if platform_auth_enabled() and env.api_style == "anthropic":
-        raise ValueError(
-            "platform auth is on, and an Anthropic-style agent can't authenticate to the Inference Gateway: it sends "
-            "its key as `x-api-key`, and the gateway accepts only bearer tokens"
-        )
     if platform_auth_enabled() and env.api_key_env not in target.env_secrets:
         raise ValueError(
             f"platform auth is on, so the agent needs a key to call the Inference Gateway: put a Helix access key "
