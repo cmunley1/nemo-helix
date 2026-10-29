@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 import pytest
@@ -35,7 +35,7 @@ def _call(name: str) -> MiddlewareCall:
 
 
 def _vm(
-    name: str, *, request: list[str] = (), response: list[str] = (), default: str | None = "models/served"
+    name: str, *, request: Sequence[str] = (), response: Sequence[str] = (), default: str | None = "models/served"
 ) -> VirtualModel:
     workspace, _, short = name.partition("/")
     return VirtualModel(
