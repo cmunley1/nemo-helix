@@ -19,6 +19,7 @@ from nemo_evals.model_policy import ends_closed_book
 from nemo_evals.trial_tokens import ROUTER_KEY_LIFETIME_SEC, ModelAccess, RouterKeyClaims, unsigned_token
 from nemo_helix_plugin.auth.access_keys.client import AsyncAccessKeysClient
 from nemo_helix_plugin.auth.access_keys.types import AccessKeyCreateRequest
+from nemo_helix_plugin.client.adapter import AsyncHelixClient, client_from_platform
 from nemo_helix_plugin.client.client import AsyncNemoClient
 from nemo_helix_plugin.client.errors import ConflictError, NotFoundError
 from nemo_helix_plugin.secrets.client import AsyncSecretsClient
@@ -66,7 +67,7 @@ async def create_router_key(
     workspace: str,
     request: RouterKeyCreate,
     caller_client: AsyncNemoClient,
-    service_client: AsyncNemoClient,
+    service_client: AsyncHelixClient,
     auth_enabled: bool,
 ) -> RouterKey:
     """Mint a closed router key for ``request.models`` and store it in ``request.secret``.
@@ -83,7 +84,7 @@ async def create_router_key(
     claims = RouterKeyClaims(model_access=ModelAccess.CLOSED, models=models)
     if auth_enabled:
         key = (
-            await AsyncAccessKeysClient.from_client(service_client).create_access_key(
+            await client_from_platform(service_client, AsyncAccessKeysClient).create_access_key(
                 body=AccessKeyCreateRequest(
                     name=f"{ACCESS_KEY_NAME_PREFIX}{workspace}/{request.secret}"[:128],
                     description="Inference Gateway key a router calls closed-book models back through the gateway with.",
