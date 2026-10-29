@@ -27,6 +27,7 @@ except ImportError as exc:
 
 # Same opt-in as test_migrations: point at a throwaway Postgres to run.
 TEST_DSN_ENV = "SCALED_EVALS_TEST_DATABASE_URL"
+pytestmark = pytest.mark.integration
 
 
 def _loses_to_an_uncommitted_claim(

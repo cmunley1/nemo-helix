@@ -1214,8 +1214,8 @@ jobs:
           python-version: "3.13"
           enable-cache: true
           cache-dependency-glob: uv.lock
-      - name: Run scaled-evals plugin tests
-        run: uv run --frozen --group scaled-evals pytest plugins/_temporary-scaled-evals/tests -v
+      - name: Run scaled-evals plugin unit tests
+        run: uv run --frozen --group scaled-evals pytest plugins/_temporary-scaled-evals/tests -m "not integration" -v
         env:
           _TYPER_FORCE_DISABLE_TERMINAL: "1"
       # The workspace venv carries a single Harbor release, but NemoOpenSandboxEnvironment must run on

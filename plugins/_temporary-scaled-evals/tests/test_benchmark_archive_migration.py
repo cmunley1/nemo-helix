@@ -31,6 +31,7 @@ def _archive(repo: BenchmarkArchiveRepository) -> dict:
     return row
 
 
+@pytest.mark.integration
 @pytest.mark.skipif(not os.environ.get(TEST_DSN_ENV), reason=f"{TEST_DSN_ENV} not set")
 def test_archive_upgrade_replay_and_queue(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     admin_dsn = os.environ[TEST_DSN_ENV]

@@ -189,6 +189,7 @@ def test_dsn_carries_search_path_and_applier_refuses_a_public_fallback() -> None
         _ensure_schema(_Conn(), "scaled_evals")  # ty: ignore[invalid-argument-type]
 
 
+@pytest.mark.integration
 @pytest.mark.skipif(not os.environ.get(TEST_DSN_ENV), reason=f"{TEST_DSN_ENV} not set")
 def test_applies_to_a_fresh_database_and_is_reappliable() -> None:
     admin_dsn = os.environ[TEST_DSN_ENV]

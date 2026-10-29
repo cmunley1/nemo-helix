@@ -66,3 +66,4 @@ nhx-sandbox = { path = "../../packages/nhx_sandbox", editable = true }
 testpaths = ["tests"]
 asyncio_mode = "auto"
 pythonpath = ["src", "opensandbox_ext"]
+markers = ["integration: Tests requiring a disposable Postgres server"]

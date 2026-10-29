@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Actual route/repository SQL; synthetic admission and task Entity Store only."""
+"""Postgres integration tests with synthetic admission and task Entity Store."""
 
 import json
 import os
@@ -46,6 +46,8 @@ from scaled_evals.api.settings import settings
 from scaled_evals.api.task_store import TaskStore
 from scaled_evals.api.tenancy import caller_is_admin
 from task_fixtures import seed_task_revision
+
+pytestmark = pytest.mark.integration
 
 USER_A = "synthetic-owner-a"
 USER_B = "synthetic-owner-b"
