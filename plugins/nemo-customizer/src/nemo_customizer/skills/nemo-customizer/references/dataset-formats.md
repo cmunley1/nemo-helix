@@ -5,11 +5,38 @@
 
 All three backends read JSONL from a platform fileset, but the **row shape and the job-JSON dataset block differ**. Pick the section that matches your plugin (automodel, unsloth, or rl/DPO).
 
-Upload the JSONL files at the **fileset root**, then reference the fileset from the job JSON `dataset` block. The filenames differ by backend, so keep the contracts separate:
+Upload the JSONL files at the **fileset root**, then reference the fileset from the job JSON `dataset` block. Name them `train.jsonl` and `validation.jsonl`, which every SFT and DPO backend reads; the job-JSON contracts differ:
 
 - **SFT (automodel, unsloth):** upload `train.jsonl` and optional `validation.jsonl`. Automodel points `dataset.training` / `dataset.validation` at the fileset; unsloth uses `dataset.path` (and `dataset.validation_path`).
-- **rl (DPO):** upload both `training.jsonl` **and** `validation.jsonl` to a single fileset, referenced by one `dataset` string (no separate validation ref) — see § NeMo-RL (DPO).
+- **rl (DPO):** upload both a training file (`train.jsonl`, or `training.jsonl`) **and** `validation.jsonl` to a single fileset, referenced by one `dataset` string (no separate validation ref) — see § NeMo-RL (DPO).
 - **rl (GRPO):** rows are **NeMo Gym rollout rows** written for the environment; the **nemo-gym-environments** skill covers them.
+
+## From Data Designer or a table
+
+`nemo customization dataset prepare SOURCE --name <fileset> --format <format>` converts, splits and uploads in one step. It reads SOURCE on this machine and needs no conversion code. SOURCE is a local `.parquet`, `.csv` or `.jsonl` file or a directory of them, or a fileset as `<workspace>/<fileset>[#path]`. `--input-format` reads files whose extension does not say, or one format from a mixed directory.
+
+**Data Designer output:** download the job's `artifacts` result and pass its `parquet-files` directory:
+
+```bash
+mkdir -p /tmp/dd && nemo jobs results download artifacts --job <dd-job> --workspace default -o /tmp/dd/artifacts.tar
+tar -xf /tmp/dd/artifacts.tar -C /tmp/dd && find /tmp/dd -type d -name parquet-files
+```
+
+Pick `--format` for the backend from the plan; the command does not guess it:
+
+| `--format` | Writes | Trains on | Default columns |
+|---|---|---|---|
+| `chat` | `messages` | automodel `sft`/`distillation`; unsloth with `dataset.apply_chat_template: true` | `instruction`/`prompt` + `response`/`completion`, or `messages` |
+| `preference` | `prompt`, `chosen`, `rejected` | rl `dpo` | `instruction`/`prompt` + `chosen` + `rejected` |
+| `prompt-completion` | `prompt`, `completion` (raw text, no chat template: base models only) | automodel; unsloth | as `chat` |
+| `embedding` | `query`, `pos_doc`, `neg_doc` | automodel `recipe: bi_encoder`/`cross_encoder` | `query` + `pos_doc` + `neg_doc` (a list) |
+| `text` | `text` | unsloth with `dataset.text_field: text` | `text` |
+
+**Not GRPO.** GRPO trains on NeMo Gym rows built per environment: the **nemo-gym-environments** skill.
+
+Other column names: `--prompt-column`, `--response-column`, `--system-column` (chat, preference), `--messages-column`, `--chosen-column`, `--rejected-column`, `--query-column`, `--positive-column`, `--negatives-column`, `--text-column`. A flag the format does not use, or a column the table lacks, fails before anything is uploaded, and the error lists the table's columns. Every format writes `train.jsonl` and `validation.jsonl`; the frozen test split goes to `<fileset>-test` (`--test-fraction`: 0 for `preference`, else 0.1). Same `--seed`, same split.
+
+Stdout is JSON: `dataset` (the training ref), `test_dataset` when there is a test split, `format`, `trained_by`, the `columns` it read, `rows` per split, and `dropped` (rows with an empty field). Use `dataset` in the job JSON and `test_dataset` for evaluation. Like `--upload-dataset`, an existing fileset fails unless `--exist-ok`, which reuses it without replacing its files: prepare changed data under a new name.
 
 ## Automodel
 
