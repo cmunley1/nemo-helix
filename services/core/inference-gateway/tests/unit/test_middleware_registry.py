@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from fastapi import HTTPException
 from nemo_helix_plugin.inference_middleware import (
     BackendFormat,
     NemoInferenceMiddleware,
@@ -214,6 +215,25 @@ class TestInferenceMiddlewareCacheAccessorImpl:
         }
         assert target.missing_secret_name is None
         assert accessor.get_backend_format("ws/smart-router", "ws/llama") is BackendFormat.ANTHROPIC_MESSAGES
+
+    @pytest.mark.parametrize("bad_format", ["Authorization: {{ 'Bearer ' ~ auth_secret }}", "Bearer {{ auth_secret }}"])
+    def test_get_inference_url_and_model_invalid_auth_header_format_maps_to_clear_error(self, bad_format: str):
+        model_cache = ModelCache()
+        provider_info = _make_model_provider_info("ws", "nim-provider")
+        provider_info.model_provider.auth_header_format = bad_format
+        provider_info.secret_value = "top-secret"
+        entity_info = ModelEntityInfo(workspace="ws", name="llama")
+        entity_info.model_providers.append(("llama-v1", provider_info))
+        model_cache.model_entity_info_map[("ws", "llama")] = entity_info
+
+        with pytest.raises(HTTPException) as exc_info:
+            self._make_accessor(model_cache=model_cache).get_inference_url_and_model("ws/llama")
+
+        assert exc_info.value.status_code == 500
+        assert "ws/nim-provider" in exc_info.value.detail
+        assert "auth_header_format" in exc_info.value.detail
+        assert bad_format not in exc_info.value.detail
+        assert "top-secret" not in exc_info.value.detail
 
     def test_get_inference_url_and_model_merges_headers_case_insensitively(self):
         model_cache = ModelCache()

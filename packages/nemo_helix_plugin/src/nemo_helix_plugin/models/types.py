@@ -19,8 +19,9 @@ the data-vs-behavior split documented in the package ``AGENTS.md``:
 - **``InferenceParams``** is a faithful replica of
   ``nhx.common.inference.InferenceParams`` (pure pydantic, no server imports).
 - **``BackendFormat``** is reused from ``nemo_helix_plugin.inference_middleware``.
-- The Jinja2 ``auth_header_format`` validator needs ``jinja2`` (not a plugin
-  dependency) so it stays server-side; the plugin field is a plain string.
+- The ``auth_header_format`` validator (literal text containing exactly one
+  ``{{ auth_secret }}`` placeholder) stays server-side; the plugin field is a
+  plain string.
 - Entity-store ``Filter`` subclasses are genuinely server-only and are not
   mirrored here; the client passes filters as a ``filter`` query-param string.
 """
@@ -456,9 +457,9 @@ class ModelEntityBaseModel(BaseModel):
 # ---------------------------------------------------------------------------
 
 _AUTH_HEADER_FORMAT_DESCRIPTION = (
-    "Jinja2 template string controlling how the API key secret is sent to the upstream. "
-    "Must contain exactly one variable named `auth_secret`, which is substituted with the "
-    "resolved secret value at request time. "
+    "Literal text containing exactly one `{{ auth_secret }}` placeholder, controlling how the API key "
+    "secret is sent to the upstream. The placeholder is substituted with the resolved secret value "
+    "at request time; no other template syntax is supported. "
     "Example: `'X-Api-Key: {{ auth_secret }}'`. "
     "If not set, defaults to `'Authorization: Bearer {{ auth_secret }}'`."
 )

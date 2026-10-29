@@ -141,6 +141,8 @@ class InferenceMiddlewareCacheAccessorImpl:
 
         Raises:
             KeyError: If ``model_entity_id`` is not in the ModelCache.
+            :class:`~fastapi.HTTPException` (500): If the provider's stored ``auth_header_format``
+                is invalid (the format is not echoed back).
         """
         try:
             ref = parse_entity_ref(model_entity_id)
@@ -161,7 +163,17 @@ class InferenceMiddlewareCacheAccessorImpl:
         for key, value in (provider.required_extra_headers or {}).items():
             outbound_headers[key] = value
         if provider_info.secret_value:
-            header_name, header_value = render_auth_header(provider_info.secret_value, provider.auth_header_format)
+            try:
+                header_name, header_value = render_auth_header(provider_info.secret_value, provider.auth_header_format)
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=500,
+                    detail=(
+                        f"Model provider '{provider.workspace}/{provider.name}' has an invalid auth_header_format; "
+                        "update the provider so auth_header_format is '<Name>: <Value>' with exactly one "
+                        "'{{ auth_secret }}' placeholder."
+                    ),
+                ) from exc
             outbound_headers[header_name] = header_value
 
         return ModelProviderInferenceTarget(

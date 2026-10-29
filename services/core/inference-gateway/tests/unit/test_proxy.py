@@ -1166,6 +1166,26 @@ async def test_proxy_request_streaming_closes_connection(mock_proxy_client, mock
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("bad_format", ["X-K: {{ auth_secret|trim }}", "Bearer {{ auth_secret }}"])
+async def test_build_next_request_invalid_auth_header_format_maps_to_clear_error(mock_request, bad_format):
+    with pytest.raises(HTTPException) as exc_info:
+        await build_next_request(
+            mock_request,
+            "http://example.com",
+            "api",
+            auth_token="top-secret",
+            auth_header_format=bad_format,
+            provider_name="ws/my-provider",
+        )
+
+    assert exc_info.value.status_code == 500
+    assert "ws/my-provider" in exc_info.value.detail
+    assert "auth_header_format" in exc_info.value.detail
+    assert bad_format not in exc_info.value.detail
+    assert "top-secret" not in exc_info.value.detail
+
+
+@pytest.mark.asyncio
 async def test_build_next_request_with_default_extra_body(mock_request):
     """Test that default_extra_body provides defaults that can be overridden by request."""
     # Request body has some fields

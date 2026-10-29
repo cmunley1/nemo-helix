@@ -155,6 +155,7 @@ async def provider_proxy(
         default_extra_headers=model_info.model_provider.default_extra_headers,
         required_extra_body=model_info.model_provider.required_extra_body,
         required_extra_headers=model_info.model_provider.required_extra_headers,
+        provider_name=f"{workspace}/{name}",
     )
 
     return await proxy_request(http_client, next_request_info)

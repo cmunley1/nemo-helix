@@ -179,6 +179,7 @@ async def build_next_request(
     required_extra_body: dict | None = None,
     required_extra_headers: dict | None = None,
     request_headers: dict[str, str] | None = None,
+    provider_name: str | None = None,
 ) -> NextRequestInfo:
     """
     This function is meant to handle generic transformations from the user-request
@@ -193,8 +194,8 @@ async def build_next_request(
         trailing_uri: The path suffix to append (e.g., "v1/chat/completions")
         auth_token: Raw secret value to inject into the auth header. When set,
             *auth_header_format* controls which header name and value format are used.
-        auth_header_format: Jinja2 template string controlling the auth header, e.g.
-            ``"X-Api-Key: {{ auth_secret }}"``. Defaults to
+        auth_header_format: Literal text containing exactly one ``{{ auth_secret }}`` placeholder,
+            controlling the auth header, e.g. ``"X-Api-Key: {{ auth_secret }}"``. Defaults to
             ``"Authorization: Bearer {{ auth_secret }}"`` when ``None``.
         body: If the caller doesn't want to proxy the request's body,
               they can pass this argument instead. If not passed, we'll
@@ -208,9 +209,15 @@ async def build_next_request(
             ``InferenceRequest.headers`` here to forward request-middleware header mutations
             to the backend. Headers in :data:`REQUEST_HEADERS_TO_DROP` are still removed
             regardless of source.
+        provider_name: ``"workspace/name"`` of the provider, used only to name it in the error
+            raised for an invalid stored ``auth_header_format``.
 
     Returns:
         NextRequestInfo with the prepared request data
+
+    Raises:
+        HTTPException: 500 if the provider's stored ``auth_header_format`` is invalid (the format
+            is not echoed back).
     """
     next_url = normalize_proxy_url(host_url, trailing_uri)
 
@@ -239,7 +246,17 @@ async def build_next_request(
         headers["content-length"] = str(len(body_bytes))
 
     if auth_token:
-        header_name, header_value = render_auth_header(auth_token, auth_header_format)
+        try:
+            header_name, header_value = render_auth_header(auth_token, auth_header_format)
+        except ValueError as exc:
+            provider_label = f"Model provider '{provider_name}'" if provider_name else "Model provider"
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    f"{provider_label} has an invalid auth_header_format; update the provider so "
+                    "auth_header_format is '<Name>: <Value>' with exactly one '{{ auth_secret }}' placeholder."
+                ),
+            ) from exc
         headers[header_name] = header_value
 
     return NextRequestInfo(
@@ -1230,6 +1247,7 @@ async def virtual_model_proxy(
                 required_extra_body=resolved_model_provider_info.model_provider.required_extra_body,
                 required_extra_headers=resolved_model_provider_info.model_provider.required_extra_headers,
                 request_headers=modified_request.headers,
+                provider_name=f"{resolved_model_provider_info.model_provider.workspace}/{resolved_model_provider_info.model_provider.name}",
             )
             proxy_response_result, response_headers, response_status = await fetch_proxy_response(
                 http_client,
