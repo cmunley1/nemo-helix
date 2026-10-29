@@ -19,7 +19,7 @@ import contextlib
 import logging
 import os
 import uuid
-from collections.abc import AsyncGenerator, Callable, Iterable, Sequence
+from collections.abc import AsyncGenerator, Callable, Iterable
 from datetime import UTC, datetime
 
 import httpx
@@ -69,12 +69,12 @@ class TrialCredentialIssuer:
         self._evaluation_name = evaluation_name
         self._policy = policy
 
-    def job_scope(self, api_key_envs: Sequence[str]) -> HarborJobScope:
+    def job_scope(self, api_key_envs: list[str]) -> HarborJobScope:
         """The scope a Harbor runner enters around each job, issuing each trial its token in every ``api_key_envs``."""
         return lambda job: self._issued_to(job, api_key_envs)
 
     @contextlib.asynccontextmanager
-    async def _issued_to(self, job: Job, api_key_envs: Sequence[str]) -> AsyncGenerator[None]:
+    async def _issued_to(self, job: Job, api_key_envs: list[str]) -> AsyncGenerator[None]:
         # The job runs on its own event loop, so the platform client gets a transport bound to it.
         event_hooks = {event: list(hooks) for event, hooks in self._client._client.event_hooks.items()}
         async with httpx.AsyncClient(
@@ -126,7 +126,7 @@ class _JobTrials:
         self._token_variables: list[str] = []
         self._key_requests = asyncio.Semaphore(MAX_CONCURRENT_KEY_REQUESTS)
 
-    async def issue(self, configs: Iterable[TrialConfig], api_key_envs: Sequence[str], *, auth_enabled: bool) -> None:
+    async def issue(self, configs: Iterable[TrialConfig], api_key_envs: list[str], *, auth_enabled: bool) -> None:
         configs = list(configs)
 
         async def issue_one(config: TrialConfig) -> str:
@@ -270,7 +270,7 @@ def _test_case_name(config: TrialConfig) -> str | None:
 
 
 def gateway_job_scope(
-    config: HarborRuntimeConfig, issuer: TrialCredentialIssuer, api_key_envs: Sequence[str]
+    config: HarborRuntimeConfig, issuer: TrialCredentialIssuer, api_key_envs: list[str]
 ) -> HarborJobScope | None:
     """``issuer``'s job scope for a runner of ``config``, or ``None`` when its agent calls no model."""
     agent = config.agent_import_path or config.agent_name or "oracle"
