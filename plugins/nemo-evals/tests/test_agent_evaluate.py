@@ -66,6 +66,7 @@ from nemo_evals.shared.metric_bundles.bundles import MetricBundle, bundle_metric
 from nemo_evals.shared.metric_bundles.hybrid import HybridMetricBundlePackager
 from nemo_evals.tasks.agent_evaluate import main as agent_eval_task_main
 from nemo_evals.tasks.runner import SDK_INITIALIZATION_EXIT_CODE
+from nemo_evals.trial_tokens import ModelAccess, ModelPolicy
 from nemo_helix_plugin.client.auth import StaticToken
 from nemo_helix_plugin.client.client import AsyncNemoClient, NemoClient
 from nemo_helix_plugin.client.errors import InternalServerError, NemoResponseValidationError, NemoTransportError
@@ -2728,3 +2729,83 @@ def test_a_registered_fabric_agent_on_the_gateway_gets_trial_tokens_in_its_model
     )
 
     assert agent_evaluate._trial_gateway(target) == (ModelRef("dev/recorded-model"), "NEMO_AGENTS_IGW_API_KEY")
+
+
+_IGW_WS = "http://h/apis/inference-gateway/v2/workspaces/ws"
+
+
+@pytest.mark.parametrize(
+    ("harness_access", "policy"),
+    [
+        pytest.param(
+            "closed",
+            ModelPolicy(model_access=ModelAccess.CLOSED, models=("ws/cb", "ws/cb-harness")),
+            id="every model closed-book",
+        ),
+        pytest.param(
+            "open",
+            ModelPolicy(model_access=ModelAccess.OPEN, models=("ws/cb", "ws/cb-harness")),
+            id="one model open",
+        ),
+    ],
+)
+def test_a_registered_agents_trials_may_call_every_gateway_model_it_names_and_are_closed_only_if_all_are(
+    monkeypatch: pytest.MonkeyPatch, harness_access: str, policy: ModelPolicy
+) -> None:
+    """The agent switching between its own models is allowed; any model outside its config is not."""
+    access = {"ws/cb": ModelAccess.CLOSED, "ws/cb-harness": ModelAccess(harness_access)}
+    monkeypatch.setattr(
+        agent_evaluate,
+        "check_trial_route",
+        lambda _client, model: SimpleNamespace(model_access=access[model.root], records_calls=True),
+    )
+    target = HarborRunnerTarget(
+        source=RegisteredAgentSource(agent=AgentRef("ws/coder")),
+        agent_kwargs={
+            "fabric_config": {
+                "models": {"default": {"base_url": f"{_IGW_WS}/openai/-/v1", "model": "cb"}},
+                "harnesses": {"codex": {"model": {"base_url": f"{_IGW_WS}/model/cb-harness/-/v1"}}},
+            }
+        },
+    )
+    spec = SimpleNamespace(target=target, publication=None)
+
+    issuer = agent_evaluate._trial_credential_issuer(
+        cast(Any, spec), cast(Any, SimpleNamespace(workspace="evals")), MagicMock(), MagicMock(), "run-1"
+    )
+
+    assert issuer is not None
+    assert issuer._policy == policy
+
+
+def test_trials_of_an_agent_whose_models_cannot_all_be_named_get_an_open_policy_without_a_list(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(
+        agent_evaluate,
+        "check_trial_route",
+        lambda *_: SimpleNamespace(model_access=ModelAccess.CLOSED, records_calls=True),
+    )
+    target = HarborRunnerTarget(
+        source=RegisteredAgentSource(agent=AgentRef("ws/coder")),
+        agent_kwargs={
+            "fabric_config": {
+                "models": {
+                    "default": {"base_url": f"{_IGW_WS}/model/cb/-/v1"},
+                    "templated": {"base_url": "${GATEWAY}/model/x/-/v1"},
+                }
+            }
+        },
+    )
+
+    issuer = agent_evaluate._trial_credential_issuer(
+        cast(Any, SimpleNamespace(target=target, publication=None)),
+        cast(Any, SimpleNamespace(workspace="evals")),
+        MagicMock(),
+        MagicMock(),
+        "run-1",
+    )
+
+    assert issuer is not None
+    assert issuer._policy == ModelPolicy(model_access=ModelAccess.OPEN)
+    assert "aren't limited to the models it configures" in caplog.text

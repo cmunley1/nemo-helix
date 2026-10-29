@@ -24,12 +24,15 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
 
+from nemo_evals.model_policy import ModelPolicyEnforcer, Refusal
 from nemo_evals.trial_spans import CallerSpan, call_span, export_request
-from nemo_evals.trial_tokens import TrialTokenReader, claims_a_trial
+from nemo_evals.trial_tokens import TrialTokenReader, caller_credential, claims_a_trial
 from nemo_helix_plugin.auth import platform_auth_enabled, verified_access_key_claims
 from nemo_helix_plugin.client.client import AsyncNemoClient
 from nemo_helix_plugin.inference_middleware import (
+    InferenceAccessRequest,
     InferenceMiddlewareContext,
+    InferenceMiddlewareUnavailableError,
     InferenceRequest,
     InferenceResponse,
     NemoInferenceMiddleware,
@@ -55,15 +58,6 @@ MAX_BATCH_BYTES = 4 * 1024 * 1024
 DEFAULT_FLUSH_INTERVAL_SEC = 1.0
 DEFAULT_SHUTDOWN_FLUSH_TIMEOUT_SEC = 5.0
 FAILURE_LOG_INTERVAL_SEC = 60.0
-
-
-def caller_credential(headers: Mapping[str, str]) -> str | None:
-    """The credential the caller sent: a bearer token, else an ``x-api-key``."""
-    authorization = headers.get("authorization", "")
-    scheme, _, token = authorization.partition(" ")
-    if scheme.lower() == "bearer" and token.strip():
-        return token.strip()
-    return headers.get("x-api-key", "").strip() or None
 
 
 class CallApi(StrEnum):
@@ -189,6 +183,7 @@ class FinishedCall:
     cancelled: bool
     attributes: Mapping[str, object] = field(default_factory=dict)
     caller: CallerSpan | None = None
+    error: bool = False
 
 
 SpanSink = Callable[[str, list[ResourceSpans]], Awaitable[int]]
@@ -314,7 +309,7 @@ class CallRecorder:
             name=call.name,
             started_at=call.started_at,
             ended_at=call.ended_at,
-            error=False,
+            error=call.error,
             attributes=attributes,
             caller=call.caller,
         )
@@ -373,6 +368,35 @@ def intake_sink(client: AsyncNemoClient) -> SpanSink:
     return sink
 
 
+def refused_call(credential: str, request: InferenceAccessRequest, refusal: Refusal) -> FinishedCall:
+    """A call the gateway refused for its caller's model policy, to record in the caller's trial."""
+    now = datetime.now(UTC)
+    target = (
+        {"nemo.virtual_model": request.virtual_model_id}
+        if request.virtual_model_id is not None
+        else {"nemo.provider": f"{request.workspace}/{request.provider_name}"}
+    )
+    api = CallApi.from_path(request.path)
+    return FinishedCall(
+        token=credential,
+        name=api.value,
+        started_at=now,
+        ended_at=now,
+        cancelled=False,
+        attributes={
+            "gen_ai.operation.name": "chat",
+            "nemo.inference.api": api.value,
+            **target,
+            "error.type": "model_policy",
+            "nemo.evals.refusal.reason": refusal.reason.value,
+            "nemo.evals.refusal.detail": refusal.detail,
+            **TokenUsage(uncached_input_tokens=0, output_tokens=0).attributes(),
+        },
+        caller=CallerSpan.from_headers(request.headers.get("traceparent"), request.headers.get("tracestate")),
+        error=True,
+    )
+
+
 class TrialRecordingConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -425,15 +449,18 @@ class _ObservedCall:
 
 
 class TrialRecordingMiddleware(NemoInferenceMiddleware):
-    """Record each call made with a trial token to Intake, in the trial.
+    """Record each call made with a trial token to Intake, in the trial, and hold every evals credential to its policy.
 
     It records from ``response_middleware``. Listed in ``request_middleware`` too, a call's span starts when the
-    gateway received the call rather than when the response began.
+    gateway received the call rather than when the response began. Installed, it checks every gateway call against
+    the model policy of the caller's evals credential (see :mod:`nemo_evals.model_policy`), whichever VirtualModels
+    list it, and records each call it refuses in the caller's trial.
     """
 
     def __init__(self) -> None:
         super().__init__()
         self._recorder: CallRecorder | None = None
+        self._enforcer: ModelPolicyEnforcer | None = None
 
     def supports_middleware_phase(self, phase: str) -> bool:
         return phase in {"request", "response"}
@@ -445,13 +472,26 @@ class TrialRecordingMiddleware(NemoInferenceMiddleware):
 
     async def on_startup(self) -> None:
         client = self._get_platform_client("on_startup")
-        reader = TrialTokenReader(verified_access_key_claims if platform_auth_enabled() else None)
-        self._recorder = CallRecorder(reader, intake_sink(client))
-        self._recorder.start()
+        auth_enabled = platform_auth_enabled()
+        reader = TrialTokenReader(verified_access_key_claims if auth_enabled else None)
+        recorder = CallRecorder(reader, intake_sink(client))
+        self._recorder = recorder
+        self._enforcer = ModelPolicyEnforcer(
+            reader,
+            self.get_virtual_model,
+            auth_enabled=auth_enabled,
+            on_refused=lambda credential, request, refusal: recorder.record(refused_call(credential, request, refusal)),
+        )
+        recorder.start()
 
     async def on_shutdown(self) -> None:
         if self._recorder is not None:
             await self._recorder.stop()
+
+    async def check_access(self, request: InferenceAccessRequest) -> None:
+        if self._enforcer is None:
+            raise InferenceMiddlewareUnavailableError("The evals model policy check hasn't started.")
+        await self._enforcer.check(request)
 
     async def process_request(
         self,

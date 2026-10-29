@@ -16,7 +16,6 @@ from nemo_evals.trial_tokens import (
     TOKEN_LIFETIME_SEC,
     ModelAccess,
     TrialClaims,
-    TrialPolicy,
     TrialTokenReader,
     claims_a_trial,
     unsigned_token_claims,
@@ -30,7 +29,8 @@ TRIAL = TrialClaims(
     intake_workspace="evals",
     evaluation="bench",
     task="trial-rec/hello-world",
-    policy=TrialPolicy(model_access=ModelAccess.CLOSED),
+    model_access=ModelAccess.CLOSED,
+    models=("default/cb-model",),
 )
 
 
@@ -74,7 +74,8 @@ def test_the_claims_fit_what_the_auth_service_accepts_as_service_attributes() ->
         "intake_workspace": "evals",
         "evaluation": "bench",
         "task": "trial-rec/hello-world",
-        "policy": {"model_access": "closed"},
+        "model_access": "closed",
+        "models": ["default/cb-model"],
     }
 
 
@@ -84,7 +85,8 @@ def test_the_claims_fit_what_the_auth_service_accepts_as_service_attributes() ->
         pytest.param(_claims(), TRIAL, id="a trial"),
         pytest.param(_claims(v=2), None, id="a shape this reader doesn't know"),
         pytest.param(_claims(kind="judge"), None, id="another evals use"),
-        pytest.param(_claims(policy={"model_access": "anything"}), None, id="an unknown policy"),
+        pytest.param(_claims(model_access="anything"), None, id="an unknown policy"),
+        pytest.param(_claims(models=None), None, id="a closed policy that lists no models"),
         pytest.param({"nhx_service_attributes": {"other": TRIAL.service_attributes()}}, None, id="another service"),
         pytest.param({"evals": TRIAL.service_attributes()}, None, id="outside the service attributes"),
         pytest.param({}, None, id="no claims"),

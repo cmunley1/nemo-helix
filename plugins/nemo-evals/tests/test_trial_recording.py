@@ -14,6 +14,7 @@ from typing import Any
 
 import pytest
 from nemo_evals import trial_recording
+from nemo_evals.model_policy import ModelPolicyEnforcer
 from nemo_evals.trial_recording import (
     MIDDLEWARE_NAME,
     CallApi,
@@ -24,6 +25,7 @@ from nemo_evals.trial_recording import (
     TrialRecordingMiddleware,
     caller_credential,
     model_from_payload,
+    refused_call,
     usage_from_payload,
 )
 from nemo_evals.trial_spans import (
@@ -33,10 +35,17 @@ from nemo_evals.trial_spans import (
     TEST_CASE_ATTRIBUTE,
     CallerSpan,
 )
-from nemo_evals.trial_tokens import ModelAccess, TrialClaims, TrialPolicy, TrialTokenReader, unsigned_trial_token
+from nemo_evals.trial_tokens import ModelAccess, TrialClaims, TrialTokenReader, unsigned_trial_token
 from nemo_helix_plugin.client.oidc import decode_jwt_claims
-from nemo_helix_plugin.inference_middleware import InferenceMiddlewareContext, InferenceRequest, InferenceResponse
-from opentelemetry.proto.trace.v1.trace_pb2 import ResourceSpans, Span
+from nemo_helix_plugin.inference_middleware import (
+    InferenceAccessRequest,
+    InferenceMiddlewareContext,
+    InferenceMiddlewareError,
+    InferenceMiddlewareUnavailableError,
+    InferenceRequest,
+    InferenceResponse,
+)
+from opentelemetry.proto.trace.v1.trace_pb2 import ResourceSpans, Span, Status
 
 NOW = datetime.now(UTC)
 TRIAL = TrialClaims(
@@ -44,7 +53,7 @@ TRIAL = TrialClaims(
     intake_workspace="evals",
     evaluation="run-1",
     task="hello",
-    policy=TrialPolicy(model_access=ModelAccess.OPEN),
+    model_access=ModelAccess.OPEN,
 )
 TOKEN = unsigned_trial_token(TRIAL)
 
@@ -202,6 +211,47 @@ async def test_a_call_made_with_a_trial_token_is_recorded_in_the_trial() -> None
     assert attributes["gen_ai.usage.output_tokens"] == 5
     assert attributes["gen_ai.request.model"] == "meta/llama-3.3-70b"
     assert attributes["nemo.virtual_model"] == "models/agent-model"
+
+
+async def test_a_call_refused_for_its_trials_policy_is_recorded_in_the_trial_as_a_free_failed_call() -> None:
+    """A refused call costs nothing; recording it with zero tokens keeps the trial's usage counted from the gateway."""
+    sink = Sink()
+    reader = _reader(TOKEN)
+    middleware = _middleware(reader, sink)
+    assert middleware._recorder is not None
+    recorder = middleware._recorder
+    middleware._enforcer = ModelPolicyEnforcer(
+        reader,
+        lambda _: None,
+        auth_enabled=True,
+        on_refused=lambda credential, request, refusal: recorder.record(refused_call(credential, request, refusal)),
+    )
+    request = InferenceAccessRequest(
+        request_id="req-1",
+        workspace="models",
+        path="v1/responses",
+        headers={"authorization": f"Bearer {TOKEN}"},
+        provider_name="nvidia",
+    )
+
+    with pytest.raises(InferenceMiddlewareError):
+        await middleware.check_access(request)
+    await recorder.flush()
+
+    [(workspace, span)] = _spans(sink.sent)
+    attributes = _attributes(span)
+    assert (workspace, span.name, span.status.code) == ("evals", "responses", Status.STATUS_CODE_ERROR)
+    assert attributes[GATEWAY_CALL_ATTRIBUTE] is True
+    assert attributes["nemo.evals.refusal.reason"] == "provider_route"
+    assert attributes["nemo.provider"] == "models/nvidia"
+    assert (attributes["gen_ai.usage.input_tokens"], attributes["gen_ai.usage.output_tokens"]) == (0, 0)
+
+
+async def test_access_is_refused_until_the_policy_check_has_started() -> None:
+    request = InferenceAccessRequest(request_id="r", workspace="models", path="v1/responses", headers={})
+
+    with pytest.raises(InferenceMiddlewareUnavailableError):
+        await TrialRecordingMiddleware().check_access(request)
 
 
 CALLER_TRACE = "01a182ecbd457d118e02830498804285"

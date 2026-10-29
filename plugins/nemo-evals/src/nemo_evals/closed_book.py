@@ -14,13 +14,17 @@ from __future__ import annotations
 import copy
 import logging
 import re
-from collections.abc import MutableMapping
+import time
+from collections.abc import Awaitable, Callable, Mapping, MutableMapping
 from dataclasses import dataclass, field
 from typing import Any
 
+from nemo_evals.trial_tokens import ModelAccess, TrialTokenReader, caller_credential, claims_evals_credential
+from nemo_helix_plugin.auth import platform_auth_enabled, verified_access_key_claims
 from nemo_helix_plugin.inference_middleware import (
     InferenceMiddlewareContext,
     InferenceMiddlewareError,
+    InferenceMiddlewareUnavailableError,
     InferenceRequest,
     ModelProviderInferenceTarget,
     NemoInferenceMiddleware,
@@ -46,6 +50,8 @@ _PROVIDER_FEATURE_KEYS = (
     "web_search_options",
 )
 _PROVIDER_STORED_HISTORY_KEYS = ("conversation", "previous_response_id")
+_PLATFORM_KEY_CACHE_SEC = 60.0
+_MAX_CACHED_PLATFORM_KEYS = 1024
 _SELF_SEARCHING_MODEL = re.compile(
     r"(?:^|/)perplexity/|(?:^|[/_-])(?:sonar|search)(?:-|$)|deep-research|:online$", re.IGNORECASE
 )
@@ -152,12 +158,87 @@ def _tool_choice_survives(choice: MutableMapping[str, Any], kept: _KeptTools, re
     return survives
 
 
+PlatformKeyVerifier = Callable[[str], Awaitable[Mapping[str, Any] | None]]
+
+
+class RouterCredentialCheck:
+    """Whether a provider that calls back into the gateway is held to a closed model policy.
+
+    A provider such as a router deployment holds a platform credential and calls other models back through the
+    gateway on its caller's behalf. Closed-book can't see those calls, so it serves such a provider only when its
+    credential is a closed evals router key, which the gateway holds to closed-book models. Any other provider
+    credential, such as a model provider's own API key, is not a platform credential and passes.
+    """
+
+    def __init__(
+        self,
+        reader: TrialTokenReader,
+        verify_platform_key: PlatformKeyVerifier | None,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._reader = reader
+        self._verify_platform_key = verify_platform_key
+        self._clock = clock
+        self._platform_keys: dict[str, tuple[float, bool]] = {}
+
+    async def refusal(self, provider_headers: Mapping[str, str], model: str) -> str | None:
+        """Why the provider sending ``provider_headers`` can't serve ``model`` closed-book; ``None`` when it can."""
+        credential = caller_credential(provider_headers)
+        if credential is None:
+            return None
+        if claims_evals_credential(credential):
+            claims = await self._reader.claims(credential)
+            if claims is not None and claims.model_access is ModelAccess.CLOSED:
+                return None
+        elif not await self._is_platform_key(credential):
+            return None
+        return (
+            f"The provider serving {model!r} calls models back through the gateway with a credential that isn't a "
+            "closed evals router key, so the models it calls might not be closed-book."
+        )
+
+    async def _is_platform_key(self, credential: str) -> bool:
+        if self._verify_platform_key is None:
+            return False
+        now = self._clock()
+        cached = self._platform_keys.get(credential)
+        if cached is not None and now < cached[0]:
+            return cached[1]
+        is_platform_key = await self._verify_platform_key(credential) is not None
+        if len(self._platform_keys) >= _MAX_CACHED_PLATFORM_KEYS:
+            self._platform_keys.clear()
+        self._platform_keys[credential] = (now + _PLATFORM_KEY_CACHE_SEC, is_platform_key)
+        return is_platform_key
+
+
+def references_stored_items(body: Mapping[str, Any]) -> bool:
+    """Whether a Responses request's ``input`` refers to items the provider stored, by ``item_reference``."""
+    items = body.get("input")
+    return isinstance(items, list) and any(
+        isinstance(item, Mapping) and item.get("type") == "item_reference" for item in items
+    )
+
+
 class ClosedBookMiddleware(NemoInferenceMiddleware):
     """Strip provider-executed tools and refuse self-searching models.
 
     Place it last in ``request_middleware`` so it sees the model a routing
     middleware selected.
     """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._router_check: RouterCredentialCheck | None = None
+
+    def _router_credentials(self) -> RouterCredentialCheck:
+        if self._router_check is None:
+            auth_enabled = platform_auth_enabled()
+            self._router_check = RouterCredentialCheck(
+                TrialTokenReader(verified_access_key_claims if auth_enabled else None),
+                verified_access_key_claims if auth_enabled else None,
+            )
+        return self._router_check
 
     def supports_middleware_phase(self, phase: str) -> bool:
         return phase == "request"
@@ -199,8 +280,19 @@ class ClosedBookMiddleware(NemoInferenceMiddleware):
                 f"The provider serving {model!r} adds provider-executed tools or features to requests, "
                 "so it cannot be served closed-book.",
             )
+        try:
+            router_refusal = await self._router_credentials().refusal(target.outbound_headers, model)
+        except Exception as exc:
+            logger.warning("Couldn't check the credential of the provider serving %r", model, exc_info=True)
+            raise InferenceMiddlewareUnavailableError(
+                f"The credential of the provider serving {model!r} couldn't be checked."
+            ) from exc
+        if router_refusal is not None:
+            raise _refusal(ctx, model, "router_credential_not_closed", router_refusal)
         forwarded = {**target.default_extra_body, **request.body, **target.required_extra_body}
         stored = [key for key in _PROVIDER_STORED_HISTORY_KEYS if forwarded.get(key) is not None]
+        if references_stored_items(forwarded):
+            stored.append("item_reference input items")
         if stored:
             raise _refusal(
                 ctx,

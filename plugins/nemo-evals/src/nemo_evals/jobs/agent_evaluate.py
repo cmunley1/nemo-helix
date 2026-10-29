@@ -60,7 +60,9 @@ from nemo_evals.jobs.gateway_models import (
     agent_gateway_origin,
     check_gateway_model,
     check_trial_route,
+    fabric_gateway_models,
     fabric_gateway_route,
+    gateway_model_id,
     point_agent_at_gateway_model,
     rebase_registered_agent_config,
     sandbox_agent_channel,
@@ -100,6 +102,7 @@ from nemo_evals.task_refs import (
     validate_execution_support,
     validate_scoring,
 )
+from nemo_evals.trial_tokens import ModelAccess, ModelPolicy
 from nemo_helix_plugin.client.adapter import AsyncHelixClient, client_from_platform
 from nemo_helix_plugin.client.client import AsyncNemoClient, NemoClient
 from nemo_helix_plugin.client.errors import (
@@ -744,14 +747,39 @@ def _trial_credential_issuer(
         return None
     publication = spec.publication.intake if spec.publication is not None else None
     route = check_trial_route(platform_client, gateway[0])
+    models = _trial_models(spec.target, gateway[0])
+    if models is None:
+        logger.warning(
+            "The agent's config names a gateway model evals can't read, so its trials' model calls aren't limited "
+            "to the models it configures"
+        )
+    closed = models is not None and all(
+        (route if model == gateway[0] else check_trial_route(platform_client, model)).model_access is ModelAccess.CLOSED
+        for model in models
+    )
     return TrialCredentialIssuer(
         async_client,
         run_id=run_id,
         intake_workspace=ctx.workspace,
         evaluation_name=publication.evaluation_id if publication is not None else None,
-        model_access=route.model_access,
+        policy=ModelPolicy(
+            model_access=ModelAccess.CLOSED if closed else ModelAccess.OPEN,
+            models=tuple(gateway_model_id(model) for model in models) if models is not None else None,
+        ),
         records_calls=route.records_calls,
     )
+
+
+def _trial_models(target: Target | None, primary: ModelRef) -> list[ModelRef] | None:
+    """Every gateway model a Harbor target's trials call, ``primary`` first; ``None`` when they can't all be named."""
+    if not isinstance(target, HarborRunnerTarget) or not isinstance(target.source, RegisteredAgentSource):
+        return [primary]
+    config = registered_agent_config(target)
+    try:
+        models = fabric_gateway_models(config) if config is not None else []
+    except ValueError:
+        return None
+    return [primary, *(model for model in models if model != primary)]
 
 
 def _trial_gateway(target: Target | None) -> tuple[ModelRef, str] | None:

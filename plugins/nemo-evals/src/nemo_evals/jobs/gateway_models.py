@@ -286,6 +286,12 @@ async def _require_closed_book_model(
         )
 
 
+def gateway_model_id(model: ModelRef) -> str:
+    """``workspace/name`` of the VirtualModel a gateway model reference names, as the gateway identifies it."""
+    workspace, name = parse_workspace_name_ref(model.root, label="Gateway model")
+    return f"{workspace}/{name}"
+
+
 def is_closed_book_route(virtual_model: VirtualModel) -> bool:
     """Whether ``virtual_model`` ends its request middleware with the closed-book middleware."""
     return (

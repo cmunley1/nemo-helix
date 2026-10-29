@@ -22,7 +22,7 @@ from harbor.utils.env import resolve_env_vars
 from nemo_evals.harbor import trial_credentials
 from nemo_evals.harbor.trial_credentials import TrialCredentialIssuer, gateway_job_scope
 from nemo_evals.intake.mapping import session_id_for
-from nemo_evals.trial_tokens import TOKEN_LIFETIME_SEC, ModelAccess, TrialClaims, TrialPolicy, TrialTokenReader
+from nemo_evals.trial_tokens import TOKEN_LIFETIME_SEC, ModelAccess, ModelPolicy, TrialClaims, TrialTokenReader
 from nemo_helix_plugin.client.client import AsyncNemoClient
 from nemo_helix_plugin.client.oidc import NHXOIDCConfig
 from nhx_evals_sdk.agent_eval.runtimes.harbor.runtime import HarborRuntimeConfig
@@ -204,13 +204,16 @@ def hooks(job: Job, monkeypatch: pytest.MonkeyPatch) -> Hooks:
     return Hooks(job, monkeypatch)
 
 
+CLOSED = ModelPolicy(model_access=ModelAccess.CLOSED, models=("default/cb-model",))
+
+
 def _issuer() -> TrialCredentialIssuer:
     return TrialCredentialIssuer(
         AsyncNemoClient(base_url="http://platform.test"),
         run_id=RUN,
         intake_workspace="evals",
         evaluation_name="run-1",
-        model_access=ModelAccess.CLOSED,
+        policy=CLOSED,
     )
 
 
@@ -220,7 +223,7 @@ def _claims(config: TrialConfig) -> TrialClaims:
         intake_workspace="evals",
         evaluation="run-1",
         task="trial-rec/hello-world",
-        policy=TrialPolicy(model_access=ModelAccess.CLOSED),
+        **CLOSED.model_dump(),
     )
 
 

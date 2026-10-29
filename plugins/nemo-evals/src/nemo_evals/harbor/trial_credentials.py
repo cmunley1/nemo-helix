@@ -30,7 +30,7 @@ from harbor.models.trial.result import TrialResult
 from harbor.trial.hooks import TrialHookEvent
 from nemo_evals.intake.mapping import session_id_for
 from nemo_evals.trial_spans import export_request, trial_root_span
-from nemo_evals.trial_tokens import TOKEN_LIFETIME_SEC, ModelAccess, TrialClaims, TrialPolicy, unsigned_trial_token
+from nemo_evals.trial_tokens import TOKEN_LIFETIME_SEC, ModelAccess, ModelPolicy, TrialClaims, unsigned_trial_token
 from nemo_helix_plugin.auth.access_keys.client import AsyncAccessKeysClient
 from nemo_helix_plugin.auth.access_keys.types import AccessKeyCreateRequest
 from nemo_helix_plugin.client.client import AsyncNemoClient
@@ -46,6 +46,7 @@ MAX_CONCURRENT_KEY_REQUESTS = 8
 ACCESS_KEY_SCOPE = "inference"
 ACCESS_KEY_NAME_PREFIX = "nemo-evals-trial "
 MODEL_FREE_AGENTS = frozenset({"oracle", "nop"})
+_OPEN = ModelPolicy(model_access=ModelAccess.OPEN)
 
 
 class TrialCredentialIssuer:
@@ -58,7 +59,7 @@ class TrialCredentialIssuer:
         run_id: str,
         intake_workspace: str,
         evaluation_name: str | None = None,
-        model_access: ModelAccess = ModelAccess.OPEN,
+        policy: ModelPolicy = _OPEN,
         records_calls: bool = False,
     ) -> None:
         self.records_calls = records_calls
@@ -66,7 +67,7 @@ class TrialCredentialIssuer:
         self._run_id = run_id
         self._intake_workspace = intake_workspace
         self._evaluation_name = evaluation_name
-        self._policy = TrialPolicy(model_access=model_access)
+        self._policy = policy
 
     def job_scope(self, api_key_env: str) -> HarborJobScope:
         """The scope a Harbor runner enters around each job, issuing its trials their tokens in ``api_key_env``."""
@@ -103,7 +104,8 @@ class TrialCredentialIssuer:
             intake_workspace=self._intake_workspace,
             evaluation=self._evaluation_name,
             task=_test_case_name(config),
-            policy=self._policy,
+            model_access=self._policy.model_access,
+            models=self._policy.models,
         )
 
 
