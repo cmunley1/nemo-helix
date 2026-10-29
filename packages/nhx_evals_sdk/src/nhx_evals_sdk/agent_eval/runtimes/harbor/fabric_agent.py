@@ -180,10 +180,24 @@ _RELAY_PID_GLOB = "/tmp/nemo-fabric-relay-*.pid"
 #: Downloading it needs ``github.com`` and ``release-assets.githubusercontent.com`` during setup.
 RELAY_CLI_RELEASES_URL = "https://github.com/NVIDIA/NeMo-Relay/releases/download"
 RELAY_CLI_DIR = "/tmp/nemo-relay/bin"
+#: Waits between attempts to download the CLI or its checksum; a setup sandbox's egress can fail transiently.
+RELAY_CLI_DOWNLOAD_RETRY_DELAYS_SEC = (2.0, 5.0, 10.0)
 _RELAY_CLI_INSTALL = """
-import glob, hashlib, importlib.metadata, os, platform, shutil, subprocess, sys, urllib.request
+import glob, hashlib, importlib.metadata, os, platform, shutil, subprocess, sys, time, urllib.error, urllib.request
 if shutil.which("nemo-relay"):
     sys.exit(0)
+delays = [float(delay) for delay in sys.argv[3].split(",") if delay]
+def fetch(url, timeout):
+    for attempt, delay in enumerate([*delays, None], start=1):
+        try:
+            return urllib.request.urlopen(url, timeout=timeout).read()
+        except urllib.error.HTTPError as error:
+            if error.code < 500 or delay is None:
+                sys.exit(f"could not download {url}: {error} (attempts: {attempt})")
+        except OSError as error:
+            if delay is None:
+                sys.exit(f"could not download {url}: {error} (attempts: {attempt})")
+        time.sleep(delay)
 try:
     version = importlib.metadata.version("nemo-relay")
 except importlib.metadata.PackageNotFoundError:
@@ -194,8 +208,8 @@ if arch is None:
 libc = "musl" if glob.glob("/lib/ld-musl-*") else "gnu"
 asset = f"nemo-relay-cli-{arch}-unknown-linux-{libc}-{version}"
 url = f"{sys.argv[1]}/{version}/{asset}"
-binary = urllib.request.urlopen(url, timeout=120).read()
-expected = urllib.request.urlopen(url + ".sha256", timeout=60).read().decode().split()[0]
+binary = fetch(url, 120)
+expected = fetch(url + ".sha256", 60).decode().split()[0]
 if hashlib.sha256(binary).hexdigest() != expected:
     sys.exit(f"{asset} does not match its published sha256")
 os.makedirs(sys.argv[2], exist_ok=True)
@@ -205,9 +219,8 @@ with open(target, "wb") as handle:
 os.chmod(target, 0o755)
 check = subprocess.run([target, "--version"], capture_output=True, text=True)
 if check.returncode != 0:
-    hint = " (a musl image needs libgcc installed)" if libc == "musl" else ""
     os.remove(target)
-    sys.exit(f"{asset} does not run in this image{hint}: {(check.stderr or check.stdout).strip()[:500]}")
+    sys.exit(f"{asset} does not run in this image: {(check.stderr or check.stdout).strip()[:500]}")
 """
 
 #: An exact ``nemo-fabric`` pin inside ``fabric_package``, with or without extras.
@@ -407,7 +420,8 @@ class NemoFabricAgent(FabricAgent):  # ty: ignore[unsupported-base]
             await environment.upload_file(script, target)
         result = await environment.exec(
             f"{shlex.quote(self._runner_python)} -c {shlex.quote(_RELAY_CLI_INSTALL)} "
-            f"{shlex.quote(RELAY_CLI_RELEASES_URL)} {shlex.quote(RELAY_CLI_DIR)}",
+            f"{shlex.quote(RELAY_CLI_RELEASES_URL)} {shlex.quote(RELAY_CLI_DIR)} "
+            f"{','.join(str(delay) for delay in RELAY_CLI_DOWNLOAD_RETRY_DELAYS_SEC)}",
             env=self._install_env,
             timeout_sec=self.fabric_timeout_sec,
         )

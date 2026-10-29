@@ -128,7 +128,7 @@ When the config has a `relay` block, each trial also brings back Relay's OpenTel
 - Setup installs the `nemo-relay` CLI the Codex and Claude adapters launch, unless one is already on
   `PATH`. It downloads the release matching the `nemo-relay` package in the task's Fabric environment
   from [NVIDIA/NeMo-Relay](https://github.com/NVIDIA/NeMo-Relay/releases), for the image's C library,
-  checks its published `sha256`, and makes sure it runs. An Alpine or other musl image needs `libgcc`.
+  checks its published `sha256`, and makes sure it runs. A failed download is retried a few times.
 - Relay sends model credentials only over HTTPS or to a loopback address. When a model's gateway URL is
   plain HTTP, as it is from a task container, the agent calls it through a forwarder on `127.0.0.1`
   that passes requests through unchanged.

@@ -14,6 +14,10 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
+from collections.abc import Callable
+from email.message import Message
 from pathlib import Path
 from typing import Any, cast
 
@@ -210,7 +214,7 @@ def _release(tmp_path: Path, *, checksum: str | None = None, binary: bytes = REL
 
 def _install(base_url: str, target: Path, path: str = "/nonexistent") -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [sys.executable, "-c", fabric_agent._RELAY_CLI_INSTALL, base_url, str(target)],
+        [sys.executable, "-c", fabric_agent._RELAY_CLI_INSTALL, base_url, str(target), "0,0"],
         capture_output=True,
         text=True,
         env={**os.environ, "PATH": path},
@@ -226,6 +230,67 @@ def test_the_cli_matching_the_installed_bindings_is_installed(tmp_path: Path) ->
     assert result.returncode == 0, result.stderr
     assert (target / "nemo-relay").read_bytes() == RELAY_CLI
     assert os.access(target / "nemo-relay", os.X_OK)
+
+
+def _install_in_process(
+    monkeypatch: pytest.MonkeyPatch, base_url: str, target: Path, urlopen: Callable[..., Any]
+) -> object:
+    """Run the install script here with ``urlopen`` replaced; the exit code, or 0 when it runs to the end."""
+    monkeypatch.setenv("PATH", "/nonexistent")
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(sys, "argv", ["-c", base_url, str(target), "0,0"])
+    try:
+        exec(fabric_agent._RELAY_CLI_INSTALL, {"__name__": "__main__"})
+    except SystemExit as exit_:
+        return exit_.code
+    return 0
+
+
+def test_a_download_that_fails_transiently_is_retried(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A setup sandbox's egress drops connections and DNS answers now and then; one failure mustn't end the trial."""
+    base_url, target = _release(tmp_path)
+    real_urlopen = urllib.request.urlopen
+    failures = iter([urllib.error.URLError("[Errno -5] No address associated with hostname")])
+
+    def flaky_urlopen(url: str, timeout: float) -> Any:
+        if (failure := next(failures, None)) is not None:
+            raise failure
+        return real_urlopen(url, timeout=timeout)
+
+    assert _install_in_process(monkeypatch, base_url, target, flaky_urlopen) == 0
+    assert (target / "nemo-relay").read_bytes() == RELAY_CLI
+
+
+def test_a_download_that_keeps_failing_gives_up_after_its_retries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    base_url, target = _release(tmp_path)
+    attempts: list[str] = []
+
+    def unreachable(url: str, timeout: float) -> Any:
+        attempts.append(url)
+        raise urllib.error.URLError("[Errno 111] Connection refused")
+
+    code = _install_in_process(monkeypatch, base_url, target, unreachable)
+
+    assert isinstance(code, str) and "(attempts: 3)" in code and "Connection refused" in code
+    assert len(attempts) == 3
+    assert not (target / "nemo-relay").exists()
+
+
+def test_a_missing_release_is_not_retried(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A 404 means no such release for this platform; retrying only delays the error."""
+    base_url, target = _release(tmp_path)
+    attempts: list[str] = []
+
+    def not_found(url: str, timeout: float) -> Any:
+        attempts.append(url)
+        raise urllib.error.HTTPError(url, 404, "Not Found", Message(), None)
+
+    code = _install_in_process(monkeypatch, base_url, target, not_found)
+
+    assert isinstance(code, str) and "(attempts: 1)" in code and "404" in code
+    assert len(attempts) == 1
 
 
 def test_a_cli_that_doesnt_match_its_checksum_is_refused(tmp_path: Path) -> None:
