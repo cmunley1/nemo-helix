@@ -250,14 +250,26 @@ class ClickHouseTraceRepository(TraceRepository):
             ),
             rollups AS (
                 {rollups_sql}
+            ),
+            traces AS (
+                SELECT roots.*, {_rollup_columns()}
+                FROM roots
+                LEFT JOIN rollups
+                    ON roots.workspace = rollups.workspace
+                    AND roots.source_format = rollups.source_format
+                    AND roots.trace_id = rollups.trace_id
+            ),
+            sessions_covered AS (
+                SELECT workspace, session_id, {_session_coverage_columns()}
+                FROM traces
+                GROUP BY workspace, session_id
             )
             SELECT
                 {_metric_select_columns()}
-            FROM roots
-            LEFT JOIN rollups
-                ON roots.workspace = rollups.workspace
-                AND roots.source_format = rollups.source_format
-                AND roots.trace_id = rollups.trace_id
+            FROM traces
+            LEFT JOIN sessions_covered
+                ON traces.workspace = sessions_covered.workspace
+                AND traces.session_id = sessions_covered.session_id
             GROUP BY bucket_start
             ORDER BY bucket_start ASC
         """
@@ -725,14 +737,33 @@ def _quantiles_expression(expression: str, quantiles: Sequence[float]) -> str:
     return f"quantiles({', '.join(str(quantile) for quantile in quantiles)})({expression})"
 
 
+_METRIC_FIELDS = (*_TOKEN_ROLLUP_FIELDS, "cost_usd")
+
+
+def _rollup_columns() -> str:
+    """Each metric of a trace's rollup, whether gateway call spans gave it, and whether the trace is superseded."""
+    columns = [
+        f"rollups.{field} AS {field}, rollups.{field}_from_gateway AS {field}_from_gateway" for field in _METRIC_FIELDS
+    ]
+    return ", ".join([*columns, "rollups.usage_superseded AS usage_superseded"])
+
+
+def _session_coverage_columns() -> str:
+    """Per session: whether any selected trace got each metric from gateway call spans."""
+    return ", ".join(f"max({field}_from_gateway) AS {field}_covered" for field in _METRIC_FIELDS)
+
+
 def _metric_select_columns() -> str:
     columns = [
-        "roots.bucket_start AS bucket_start",
+        "traces.bucket_start AS bucket_start",
         "count() AS run_count",
-        "countIf(roots.root_status = 'error') AS failed_run_count",
+        "countIf(traces.root_status = 'error') AS failed_run_count",
     ]
-    for field in (*_TOKEN_ROLLUP_FIELDS, "cost_usd"):
-        source = f"rollups.{field}"
+    for field in _METRIC_FIELDS:
+        source = (
+            f"if(traces.usage_superseded AND NOT traces.{field}_from_gateway "
+            f"AND sessions_covered.{field}_covered, NULL, traces.{field})"
+        )
         columns.extend(
             (
                 f"sum({source}) AS {field}_sum",
@@ -744,8 +775,8 @@ def _metric_select_columns() -> str:
         (
             # Percentiles cannot yield a mean, and the design needs one; it is also what
             # makes an aggregate latency-per-token ratio derivable client-side.
-            "avg(roots.latency_ms) AS latency_ms_mean",
-            f"{_quantiles_expression('roots.latency_ms', _LATENCY_QUANTILES)} AS latency_ms_quantiles",
+            "avg(traces.latency_ms) AS latency_ms_mean",
+            f"{_quantiles_expression('traces.latency_ms', _LATENCY_QUANTILES)} AS latency_ms_quantiles",
         )
     )
     return ",\n                ".join(columns)

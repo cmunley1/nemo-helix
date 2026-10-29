@@ -378,7 +378,8 @@ the key is a Scoped Access Key the platform signs, so
 
 An agent evaluation gives each Harbor trial that calls a gateway model its own trial token, a
 credential that names the trial and the models it may call. That covers Harbor's built-in agents given a gateway model and
-registered Fabric agents whose default model goes through the gateway. The `nemo-evals-trial-recording` middleware reads the token to
+registered Fabric agents whose default model goes through the gateway; such an agent gets the token in the key
+variable of every model it calls through the gateway. The `nemo-evals-trial-recording` middleware reads the token to
 record each of the trial's model calls in Intake, as a span in the trial's trace with the token usage
 the provider reported. The span names the model the call asked for (`gen_ai.request.model`) and the
 model the response says served it (`gen_ai.response.model`), which differ when a routing provider
@@ -393,9 +394,9 @@ from headers.
 Intake counts each call's usage once. In a trace that holds gateway call spans, their usage replaces
 the agent's own spans for the same calls, as long as every gateway span in the trace recorded usage;
 if one didn't, the trace counts the agent's own numbers instead. When the agent's trace is separate, the evaluation marks
-the published trace as superseded, so the session counts the gateway's usage. The agent's own totals
-stay on its trace for inspection, and a metric the gateway doesn't report, such as cost, still counts
-from it.
+the published trace as superseded, so the session and trace metrics count the gateway's usage. The
+agent's own totals stay on its trace for inspection, and a metric the gateway doesn't report, such as
+cost, still counts from it.
 
 It takes no settings. Add it to `request_middleware`, so a call's span starts when the call arrives,
 and to `response_middleware`, where each call is recorded:

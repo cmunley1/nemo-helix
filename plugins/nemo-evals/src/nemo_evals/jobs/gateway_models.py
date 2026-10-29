@@ -182,6 +182,21 @@ def fabric_gateway_route(config: Mapping[str, Any]) -> tuple[ModelRef, str] | No
     return ref, str(model.get("api_key_env") or FABRIC_GATEWAY_KEY_ENV)
 
 
+def fabric_gateway_key_envs(config: Mapping[str, Any]) -> list[str]:
+    """The variables a Fabric config's gateway models read their key from, the default model's first, each once."""
+    shared = config.get("models") or {}
+    models = [shared.get("default"), *(model for name, model in shared.items() if name != "default")]
+    models += [
+        harness.get("model") for harness in (config.get("harnesses") or {}).values() if isinstance(harness, Mapping)
+    ]
+    envs = [
+        str(model.get("api_key_env") or FABRIC_GATEWAY_KEY_ENV)
+        for model in models
+        if isinstance(model, Mapping) and _fabric_gateway_model(model) is not None
+    ]
+    return list(dict.fromkeys(envs))
+
+
 def fabric_gateway_models(config: Mapping[str, Any]) -> list[ModelRef]:
     """Every gateway model a Fabric config's shared and harness models call, each once.
 

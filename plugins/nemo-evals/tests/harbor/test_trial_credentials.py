@@ -168,10 +168,17 @@ class Hooks:
     """The trial hooks the issuer registers on the job, fired the way Harbor fires them."""
 
     def __init__(self, job: Job, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.started: list[Any] = []
         self.ended: list[Any] = []
         self.cancelled: list[Any] = []
+        monkeypatch.setattr(job, "on_trial_started", self.started.append)
         monkeypatch.setattr(job, "on_trial_ended", self.ended.append)
         monkeypatch.setattr(job, "on_trial_cancelled", self.cancelled.append)
+
+    async def start(self, config: TrialConfig, *, minutes: int = 0) -> None:
+        result = TrialResult.model_construct(started_at=STARTED.replace(minute=minutes))
+        for hook in self.started:
+            await hook(_event(TrialEvent.START, config, result))
 
     async def end(
         self, config: TrialConfig, *, error: str | None = None, minutes: int = 1, steps: list[StepResult] | None = None
@@ -230,7 +237,7 @@ def _claims(config: TrialConfig) -> TrialClaims:
 async def test_each_trial_runs_with_its_own_token_in_place_of_the_agents_key(platform: Platform, job: Job) -> None:
     configs = job._remaining_trial_configs
 
-    async with _issuer().job_scope(KEY_ENV)(job):
+    async with _issuer().job_scope([KEY_ENV])(job):
         tokens = [resolve_env_vars(config.agent.env)[KEY_ENV] for config in configs]
         assert len(set(tokens)) == len(configs) == 2
         assert all(config.agent.env["OTHER"] == "kept" for config in configs)
@@ -248,7 +255,7 @@ async def test_a_token_is_never_written_into_the_trials_config(auth_on: Platform
     """Harbor saves each trial's config and masks only variables named like secrets; this one isn't."""
     configs = job._remaining_trial_configs
 
-    async with _issuer().job_scope("MODEL_BEARER")(job):
+    async with _issuer().job_scope(["MODEL_BEARER"])(job):
         saved = " ".join(config.model_dump_json() for config in configs)
         tokens = [resolve_env_vars(config.agent.env)["MODEL_BEARER"] for config in configs]
         assert tokens == ["minted-token-0", "minted-token-1"]
@@ -259,7 +266,7 @@ async def test_a_token_is_never_written_into_the_trials_config(auth_on: Platform
 
 
 async def test_a_minted_key_is_an_inference_key_that_expires_in_a_day(auth_on: Platform, job: Job) -> None:
-    async with _issuer().job_scope(KEY_ENV)(job):
+    async with _issuer().job_scope([KEY_ENV])(job):
         pass
 
     body = auth_on.minted()[0]
@@ -271,7 +278,7 @@ async def test_a_key_that_cant_be_minted_fails_the_job_before_any_trial_runs(aut
     auth_on.refuse_mint_number = 1
 
     with pytest.raises(RuntimeError, match="could not issue 1 of 2 trials"):
-        async with _issuer().job_scope(KEY_ENV)(job):
+        async with _issuer().job_scope([KEY_ENV])(job):
             pytest.fail("the job ran")
 
     assert auth_on.revoked() == [_jti(0)]
@@ -281,7 +288,7 @@ async def test_keys_minted_before_the_job_is_cancelled_are_revoked(auth_on: Plat
     auth_on.hold_mint_number = 1
 
     async def run() -> None:
-        async with _issuer().job_scope(KEY_ENV)(job):
+        async with _issuer().job_scope([KEY_ENV])(job):
             pytest.fail("the job ran")
 
     task = asyncio.create_task(run())
@@ -298,7 +305,7 @@ async def test_cancelling_the_job_during_cleanup_still_revokes_every_key(auth_on
     auth_on.hold_revocations = True
 
     async def run() -> None:
-        async with _issuer().job_scope(KEY_ENV)(job):
+        async with _issuer().job_scope([KEY_ENV])(job):
             pass
 
     task = asyncio.create_task(run())
@@ -317,7 +324,7 @@ async def test_a_key_that_couldnt_be_revoked_is_revoked_when_the_job_ends(
     first, _ = job._remaining_trial_configs
     auth_on.revocations_to_refuse = 1
 
-    async with _issuer().job_scope(KEY_ENV)(job):
+    async with _issuer().job_scope([KEY_ENV])(job):
         await hooks.end(first)
         assert auth_on.revoked() == []
 
@@ -329,7 +336,7 @@ async def test_a_trial_that_ends_without_error_is_recorded_and_its_key_revoked(
 ) -> None:
     first, _ = job._remaining_trial_configs
 
-    async with _issuer().job_scope(KEY_ENV)(job):
+    async with _issuer().job_scope([KEY_ENV])(job):
         await hooks.end(first)
         assert platform.root_spans() == [(_nanos(STARTED), _nanos(STARTED.replace(minute=1)))]
         assert platform.root_span_failures() == [False]
@@ -339,7 +346,7 @@ async def test_a_trial_that_ends_without_error_is_recorded_and_its_key_revoked(
 async def test_a_trial_keeps_its_key_while_harbor_will_retry_it(auth_on: Platform, job: Job, hooks: Hooks) -> None:
     first, _ = job._remaining_trial_configs
 
-    async with _issuer().job_scope(KEY_ENV)(job):
+    async with _issuer().job_scope([KEY_ENV])(job):
         await hooks.end(first, error="RuntimeError", minutes=1)
         assert auth_on.revoked() == []
         await hooks.end(first, error="RuntimeError", minutes=3)
@@ -351,7 +358,7 @@ async def test_a_trial_keeps_its_key_while_harbor_will_retry_it(auth_on: Platfor
 async def test_an_error_harbor_doesnt_retry_ends_the_trial(auth_on: Platform, job: Job, hooks: Hooks) -> None:
     first, _ = job._remaining_trial_configs
 
-    async with _issuer().job_scope(KEY_ENV)(job):
+    async with _issuer().job_scope([KEY_ENV])(job):
         await hooks.end(first, error="AgentTimeoutError")
         assert auth_on.revoked() == [_jti(0)]
         assert auth_on.root_span_failures() == [True]
@@ -367,7 +374,7 @@ async def test_a_multi_step_trial_whose_step_failed_has_a_failed_root(
         )
     )
 
-    async with _issuer().job_scope(KEY_ENV)(job):
+    async with _issuer().job_scope([KEY_ENV])(job):
         await hooks.end(first, steps=[step])
 
     assert platform.root_span_failures() == [True]
@@ -379,17 +386,68 @@ async def test_a_cancelled_trial_has_its_key_revoked_and_is_still_recorded(
     """Harbor ends a cancelled trial after cancelling it, with an error it would otherwise retry."""
     first, _ = job._remaining_trial_configs
 
-    async with _issuer().job_scope(KEY_ENV)(job):
+    async with _issuer().job_scope([KEY_ENV])(job):
         await hooks.cancel(first)
         assert platform.revoked() == ([_jti(0)] if platform.auth_enabled else [])
         await hooks.end(first, error="CancelledError")
         assert len(platform.root_spans()) == 1
 
 
+async def test_a_trial_the_job_stops_mid_attempt_still_gets_a_failed_root(
+    auth_on: Platform, job: Job, hooks: Hooks
+) -> None:
+    """A cancelled task Job's process is told to stop, and Harbor ends none of its running trials."""
+    first, second = job._remaining_trial_configs
+
+    async with _issuer().job_scope([KEY_ENV])(job):
+        await hooks.start(first)
+        await hooks.start(second)
+        await hooks.end(second)
+
+    assert auth_on.root_span_failures() == [False, True]
+    assert auth_on.root_spans()[-1][0] == _nanos(STARTED)
+    assert sorted(auth_on.revoked()) == [_jti(0), _jti(1)]
+
+
+async def test_a_retried_trial_stopped_mid_attempt_keeps_its_first_start(
+    auth_on: Platform, job: Job, hooks: Hooks
+) -> None:
+    first, _ = job._remaining_trial_configs
+
+    async with _issuer().job_scope([KEY_ENV])(job):
+        await hooks.start(first, minutes=0)
+        await hooks.end(first, error="RuntimeError", minutes=1)
+        await hooks.start(first, minutes=2)
+
+    assert auth_on.root_span_failures() == [True, True]
+    assert auth_on.root_spans()[-1][0] == _nanos(STARTED)
+
+
+async def test_a_trial_that_never_started_gets_no_root(auth_on: Platform, job: Job, hooks: Hooks) -> None:
+    async with _issuer().job_scope([KEY_ENV])(job):
+        pass
+
+    assert auth_on.root_spans() == []
+    assert sorted(auth_on.revoked()) == [_jti(0), _jti(1)]
+
+
+async def test_a_trial_gets_its_one_token_in_every_variable_its_agent_reads_a_gateway_key_from(
+    auth_on: Platform, job: Job
+) -> None:
+    """A registered agent can call several gateway models, each reading its key from its own variable."""
+    configs = job._remaining_trial_configs
+
+    async with _issuer().job_scope([KEY_ENV, "HARNESS_KEY"])(job):
+        for config in configs:
+            env = resolve_env_vars(config.agent.env)
+            assert env[KEY_ENV] == env["HARNESS_KEY"]
+    assert len(auth_on.minted()) == 2
+
+
 async def test_the_job_ending_revokes_every_key_still_live(auth_on: Platform, job: Job, hooks: Hooks) -> None:
     first, _ = job._remaining_trial_configs
 
-    async with _issuer().job_scope(KEY_ENV)(job):
+    async with _issuer().job_scope([KEY_ENV])(job):
         await hooks.end(first)
 
     assert sorted(auth_on.revoked()) == [_jti(0), _jti(1)]
@@ -397,7 +455,7 @@ async def test_the_job_ending_revokes_every_key_still_live(auth_on: Platform, jo
 
 @pytest.mark.parametrize("agent", ["oracle", "nop"])
 def test_an_agent_that_calls_no_model_gets_no_tokens(agent: str) -> None:
-    assert gateway_job_scope(HarborRuntimeConfig(agent_name=agent), _issuer(), KEY_ENV) is None
+    assert gateway_job_scope(HarborRuntimeConfig(agent_name=agent), _issuer(), [KEY_ENV]) is None
 
 
 def _nanos(at: datetime) -> int:

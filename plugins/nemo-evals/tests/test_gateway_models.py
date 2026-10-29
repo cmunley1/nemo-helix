@@ -30,11 +30,13 @@ from nemo_evals.jobs.agent_spec import (
 from nemo_evals.jobs.gateway_agents import GATEWAY_PLACEHOLDER_KEY
 from nemo_evals.jobs.gateway_models import (
     AGENT_CHANNEL_HOSTS_KWARG,
+    FABRIC_GATEWAY_KEY_ENV,
     TrialRoute,
     add_gateway_key_placeholder,
     agent_gateway_origin,
     check_gateway_model,
     check_tasks_reach_the_gateway,
+    fabric_gateway_key_envs,
     fabric_gateway_route,
     point_agent_at_gateway_model,
     require_closed_book_route,
@@ -750,3 +752,19 @@ def test_a_registered_agents_gateway_route_is_read_from_its_default_model(
     model: dict[str, str], route: tuple[ModelRef, str] | None
 ) -> None:
     assert fabric_gateway_route({"models": {"default": model}}) == route
+
+
+def test_a_registered_agents_gateway_models_each_name_the_variable_they_read_their_key_from() -> None:
+    config = {
+        "models": {
+            "other": {"base_url": f"{_IGW}/openai/-/v1", "model": "cb", "api_key_env": "OTHER_KEY"},
+            "default": {"base_url": f"{_IGW}/model/cb/-/v1"},
+            "elsewhere": {"base_url": "https://integrate.api.nvidia.com/v1", "model": "x", "api_key_env": "NVIDIA_KEY"},
+        },
+        "harnesses": {
+            "codex": {"model": {"base_url": f"{_IGW}/model/cb-harness/-/v1", "api_key_env": "HARNESS_KEY"}},
+            "claude": {"model": {"base_url": f"{_IGW}/openai/-", "model": "cb-claude"}},
+        },
+    }
+
+    assert fabric_gateway_key_envs(config) == [FABRIC_GATEWAY_KEY_ENV, "OTHER_KEY", "HARNESS_KEY"]

@@ -19,7 +19,7 @@ import contextlib
 import logging
 import os
 import uuid
-from collections.abc import AsyncGenerator, Callable, Iterable
+from collections.abc import AsyncGenerator, Callable, Iterable, Sequence
 from datetime import UTC, datetime
 
 import httpx
@@ -69,12 +69,12 @@ class TrialCredentialIssuer:
         self._evaluation_name = evaluation_name
         self._policy = policy
 
-    def job_scope(self, api_key_env: str) -> HarborJobScope:
-        """The scope a Harbor runner enters around each job, issuing its trials their tokens in ``api_key_env``."""
-        return lambda job: self._issued_to(job, api_key_env)
+    def job_scope(self, api_key_envs: Sequence[str]) -> HarborJobScope:
+        """The scope a Harbor runner enters around each job, issuing each trial its token in every ``api_key_envs``."""
+        return lambda job: self._issued_to(job, api_key_envs)
 
     @contextlib.asynccontextmanager
-    async def _issued_to(self, job: Job, api_key_env: str) -> AsyncGenerator[None]:
+    async def _issued_to(self, job: Job, api_key_envs: Sequence[str]) -> AsyncGenerator[None]:
         # The job runs on its own event loop, so the platform client gets a transport bound to it.
         event_hooks = {event: list(hooks) for event, hooks in self._client._client.event_hooks.items()}
         async with httpx.AsyncClient(
@@ -84,13 +84,14 @@ class TrialCredentialIssuer:
             try:
                 auth_enabled = (await asyncio.to_thread(discover_nhx_config, self._client.base_url)).auth_enabled
                 # Harbor plans its trials in Job.create and keeps the configs it will run in a private attribute.
-                await trials.issue(job._remaining_trial_configs, api_key_env, auth_enabled=auth_enabled)
+                await trials.issue(job._remaining_trial_configs, api_key_envs, auth_enabled=auth_enabled)
+                job.on_trial_started(trials.started)
                 job.on_trial_ended(trials.ended)
                 job.on_trial_cancelled(trials.cancelled)
                 yield
             finally:
                 trials.forget_tokens()
-                cleanup = asyncio.ensure_future(trials.revoke_all())
+                cleanup = asyncio.ensure_future(trials.finish())
                 try:
                     await asyncio.shield(cleanup)
                 except asyncio.CancelledError:
@@ -121,10 +122,11 @@ class _JobTrials:
         self._cancelled: set[str] = set()
         self._ends: dict[str, int] = {}
         self._started_at: dict[str, datetime] = {}
+        self._running: set[str] = set()
         self._token_variables: list[str] = []
         self._key_requests = asyncio.Semaphore(MAX_CONCURRENT_KEY_REQUESTS)
 
-    async def issue(self, configs: Iterable[TrialConfig], api_key_env: str, *, auth_enabled: bool) -> None:
+    async def issue(self, configs: Iterable[TrialConfig], api_key_envs: Sequence[str], *, auth_enabled: bool) -> None:
         configs = list(configs)
 
         async def issue_one(config: TrialConfig) -> str:
@@ -159,7 +161,7 @@ class _JobTrials:
             os.environ[variable] = token
             self._token_variables.append(variable)
             config.agent = config.agent.model_copy(
-                update={"env": {**config.agent.env, api_key_env: f"${{{variable}}}"}}
+                update={"env": {**config.agent.env, **dict.fromkeys(api_key_envs, f"${{{variable}}}")}}
             )
 
     def forget_tokens(self) -> None:
@@ -168,12 +170,19 @@ class _JobTrials:
             os.environ.pop(variable, None)
         self._token_variables.clear()
 
+    async def started(self, event: TrialHookEvent) -> None:
+        name = event.config.trial_name
+        if name in self._trials:
+            self._started_at.setdefault(name, event.result.started_at or datetime.now(UTC))
+            self._running.add(name)
+
     async def ended(self, event: TrialHookEvent) -> None:
         """Harbor ended an attempt at a trial: record the trial's root span, and revoke its key if it's done."""
         name = event.config.trial_name
         trial = self._trials.get(name)
         if trial is None:
             return
+        self._running.discard(name)
         self._ends[name] = self._ends.get(name, 0) + 1
         started_at = self._started_at.setdefault(name, event.result.started_at or datetime.now(UTC))
         await self._record_root_span(
@@ -199,6 +208,21 @@ class _JobTrials:
         if self._retry.include_exceptions and error.exception_type not in self._retry.include_exceptions:
             return False
         return self._ends[event.config.trial_name] <= self._retry.max_retries
+
+    async def finish(self) -> None:
+        """Record a failed root span for each trial the job stopped mid-attempt, then revoke every live key.
+
+        Harbor ends no trial when its process is told to stop, as a cancelled task Job is.
+        """
+        now = datetime.now(UTC)
+        await asyncio.gather(
+            *(
+                self._record_root_span(self._trials[name], self._started_at[name], now, failed=True)
+                for name in sorted(self._running)
+            )
+        )
+        self._running.clear()
+        await self.revoke_all()
 
     async def revoke_all(self) -> None:
         await asyncio.gather(*(self._revoke(name) for name in list(self._live_keys)))
@@ -246,8 +270,8 @@ def _test_case_name(config: TrialConfig) -> str | None:
 
 
 def gateway_job_scope(
-    config: HarborRuntimeConfig, issuer: TrialCredentialIssuer, api_key_env: str
+    config: HarborRuntimeConfig, issuer: TrialCredentialIssuer, api_key_envs: Sequence[str]
 ) -> HarborJobScope | None:
     """``issuer``'s job scope for a runner of ``config``, or ``None`` when its agent calls no model."""
     agent = config.agent_import_path or config.agent_name or "oracle"
-    return None if agent in MODEL_FREE_AGENTS else issuer.job_scope(api_key_env)
+    return None if agent in MODEL_FREE_AGENTS else issuer.job_scope(api_key_envs)

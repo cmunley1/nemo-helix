@@ -2728,7 +2728,7 @@ def test_a_registered_fabric_agent_on_the_gateway_gets_trial_tokens_in_its_model
         source=RegisteredAgentSource(agent="dev/codex-agent"), agent_kwargs={"fabric_config": config}
     )
 
-    assert agent_evaluate._trial_gateway(target) == (ModelRef("dev/recorded-model"), "NEMO_AGENTS_IGW_API_KEY")
+    assert agent_evaluate._trial_gateway(target) == (ModelRef("dev/recorded-model"), ["NEMO_AGENTS_IGW_API_KEY"])
 
 
 _IGW_WS = "http://h/apis/inference-gateway/v2/workspaces/ws"

@@ -606,6 +606,8 @@ def test_a_marked_trajectory_doesnt_add_the_calls_the_gateway_recorded(client: T
 
     session = _session(client, session_id)
     assert (session["input_tokens"], session["output_tokens"], session["trace_count"]) == (300, 30, 2)
+    metrics = _trace_metrics(client, session_id)
+    assert (metrics["run_count"], metrics["input_tokens"]["sum"], metrics["output_tokens"]["sum"]) == (2, 300, 30)
 
 
 def test_an_unmarked_trajectory_still_adds_its_usage(client: TestClient, make_otlp_request) -> None:
@@ -614,6 +616,7 @@ def test_an_unmarked_trajectory_still_adds_its_usage(client: TestClient, make_ot
     _ingest_both(client, make_otlp_request, session_id, 32, marked=False)
 
     assert _session(client, session_id)["input_tokens"] == 595
+    assert _trace_metrics(client, session_id)["input_tokens"]["sum"] == 595
 
 
 def test_a_marked_trajectory_keeps_its_own_totals_for_inspection(client: TestClient, make_otlp_request) -> None:
@@ -634,6 +637,9 @@ def test_a_metric_the_gateway_doesnt_report_still_counts_from_a_marked_trajector
     session = _session(client, session_id)
     assert session["input_tokens"] == 300
     assert session["cost_usd"] == pytest.approx(0.02)
+    metrics = _trace_metrics(client, session_id)
+    assert metrics["input_tokens"]["sum"] == 300
+    assert metrics["cost_usd"]["sum"] == pytest.approx(0.02)
 
 
 def test_evaluation_views_count_a_marked_sessions_calls_once(client: TestClient, make_otlp_request) -> None:

@@ -60,6 +60,7 @@ from nemo_evals.jobs.gateway_models import (
     agent_gateway_origin,
     check_gateway_model,
     check_trial_route,
+    fabric_gateway_key_envs,
     fabric_gateway_models,
     fabric_gateway_route,
     gateway_model_id,
@@ -782,14 +783,15 @@ def _trial_models(target: Target | None, primary: ModelRef) -> list[ModelRef] | 
     return [primary, *(model for model in models if model != primary)]
 
 
-def _trial_gateway(target: Target | None) -> tuple[ModelRef, str] | None:
-    """The gateway model a Harbor target's trials call, and the variable their agent reads its key from."""
+def _trial_gateway(target: Target | None) -> tuple[ModelRef, list[str]] | None:
+    """The gateway model a Harbor target's trials call, and every variable their agent reads a gateway key from."""
     if not isinstance(target, HarborRunnerTarget):
         return None
     if target.gateway_model is not None and target.gateway_agent_env is not None:
-        return target.gateway_model, target.gateway_agent_env.api_key_env
+        return target.gateway_model, [target.gateway_agent_env.api_key_env]
     if isinstance(target.source, RegisteredAgentSource) and (config := registered_agent_config(target)) is not None:
-        return fabric_gateway_route(config)
+        route = fabric_gateway_route(config)
+        return (route[0], fabric_gateway_key_envs(config)) if route is not None else None
     return None
 
 
