@@ -19,7 +19,11 @@ from starlette.concurrency import run_in_threadpool
 from scaled_evals.api import artifacts
 from scaled_evals.api.agent_bundle_registry import accessible_bundle_for_run
 from scaled_evals.api.auth import CurrentPrincipal, current_principal
-from scaled_evals.api.db import Database, get_db, get_stream_database_factory
+from scaled_evals.api.db import (
+    Database,
+    get_request_db,
+    get_request_stream_database_factory,
+)
 from scaled_evals.api.evaluation_logs import collect_log_lines
 from scaled_evals.api.runnability import BlockedPreflight, SecretReadable, caller_secret_readable, preflight_evaluation
 from scaled_evals.api.schemas.common import (
@@ -72,26 +76,14 @@ from scaled_evals.models.sbom import SBOM_FILE_NAME
 
 router = APIRouter(prefix="/evaluations", tags=["evaluations"])
 
-Db = Annotated[Database, Depends(get_db)]
+Db = Annotated[Database, Depends(get_request_db)]
 Principal = Annotated[CurrentPrincipal, Depends(current_principal)]
 Secrets = Annotated[SecretReadable, Depends(caller_secret_readable)]
-StreamDatabaseFactory = Annotated[Callable[[], AbstractContextManager[Database]], Depends(get_stream_database_factory)]
+StreamDatabaseFactory = Annotated[
+    Callable[[], AbstractContextManager[Database]], Depends(get_request_stream_database_factory)
+]
 
 _TERMINAL_STATUSES = frozenset({"succeeded", "failed", "cancelled"})
-
-
-def _evaluation_reads(db: Database) -> Any:
-    """Return the source for evaluation list/get reads.
-
-    Entity Store reads are served by the plugin's projection. The import is
-    deferred so this package keeps working without the plugin installed, and
-    Postgres stays both the default and the fallback.
-    """
-    if not settings.entity_store_reads_enabled:
-        return db.evaluations
-    from nemo_scaled_evals_plugin.projection import evaluation_reader  # noqa: PLC0415
-
-    return evaluation_reader()
 
 
 def _submit_now(evaluation_id: str) -> None:
@@ -332,8 +324,8 @@ def _ensure_evaluation_exists(db: Database, evaluation_id: str) -> None:
         raise _http_error(404, "not_found", "evaluation not found")
 
 
-def _load_archive_row(db: Database, evaluation_id: str) -> dict[str, Any]:
-    row = db.evaluations.load_archive_row(evaluation_id)
+def _load_archive_row(db: Database, evaluation_id: str, *, for_write: bool = False) -> dict[str, Any]:
+    row = db.evaluations.load_archive_row(evaluation_id, for_write=for_write)
     if row is None:
         raise _http_error(404, "not_found", "evaluation not found")
     return row
@@ -595,7 +587,7 @@ def list_evaluations(
     more rows exist.
     """
     _ = team_id  # Teams are deliberately deferred.
-    rows = _evaluation_reads(db).list(
+    rows = db.evaluations.list(
         limit=limit,
         cursor=cursor,
         order=order,
@@ -606,6 +598,11 @@ def list_evaluations(
         owner_id=current.owner_id if mine else None,
         q=q,
     )
+    if settings.entity_store_reads_enabled:
+        from nemo_scaled_evals_plugin.projection import evaluation_reader
+
+        reader = evaluation_reader()
+        rows = [reader.get(row["id"]) or row for row in rows]
     return page_from_rows(rows, limit, Evaluation)
 
 
@@ -618,9 +615,13 @@ def get_evaluation(evaluation_id: str, db: Db) -> EvaluationResponse:
     `result` JSON once the run has reached a terminal state (all null/None until
     then). 404 if not found or soft-deleted.
     """
-    row = _evaluation_reads(db).get(evaluation_id)
+    row = db.evaluations.get(evaluation_id)
     if row is None:
         raise _http_error(404, "not_found", "evaluation not found")
+    if settings.entity_store_reads_enabled:
+        from nemo_scaled_evals_plugin.projection import evaluation_reader
+
+        row = evaluation_reader().get(evaluation_id) or row
     return _response(row)
 
 
@@ -792,8 +793,10 @@ def retry_evaluation(evaluation_id: str, db: Db, secrets: Secrets) -> Evaluation
     result and artifact paths are reused for the newest execution. The caller
     must be able to read every referenced credential secret (422 `invalid_reference`).
     """
-    existing = db.evaluations.get(evaluation_id)
-    for provider, ref in sorted(((existing or {}).get("credentials") or {}).items()):
+    existing = db.evaluations.get(evaluation_id, for_write=True)
+    if existing is None:
+        raise _http_error(404, "not_found", "evaluation not found")
+    for provider, ref in sorted((existing.get("credentials") or {}).items()):
         try:
             qualified_secret_ref(ref)
         except ValueError:
@@ -809,8 +812,6 @@ def retry_evaluation(evaluation_id: str, db: Db, secrets: Secrets) -> Evaluation
             )
     row = db.evaluations.retry_failed(evaluation_id)
     if row is None:
-        if existing is None:
-            raise _http_error(404, "not_found", "evaluation not found")
         if existing["status"] != "failed":
             raise _http_error(
                 409,
@@ -893,7 +894,12 @@ async def logs_stream(evaluation_id: str, request: Request, database_factory: St
             while monotonic() < deadline:
                 if await request.is_disconnected():
                     break
-                row, lines = await run_in_threadpool(_load_stream_log_snapshot, database_factory, evaluation_id)
+                try:
+                    row, lines = await run_in_threadpool(_load_stream_log_snapshot, database_factory, evaluation_id)
+                except HTTPException as exc:
+                    if exc.status_code == 404:
+                        break
+                    raise
                 for line in lines[sent:]:
                     yield f"event: log\ndata: {json.dumps({'line': line})}\n\n"
                 sent = len(lines)
@@ -1087,7 +1093,7 @@ def build_archive(
     db: Db,
     response: Response,
 ) -> EvaluationArchiveResponse:
-    row = _load_archive_row(db, evaluation_id)
+    row = _load_archive_row(db, evaluation_id, for_write=True)
     if row["archive_status"] == "ready" and not body.force:
         response.status_code = 200
         return _archive_response(row)

@@ -261,6 +261,21 @@ Consequences worth knowing before you rely on this:
   window of at most 90 days. Queued and active counts still come from the
   evaluation store. A span that fails to record is logged and skipped, so
   analytics can undercount during an Intake outage.
+- **Evaluation access is enforced per request.** Private evaluations and
+  benchmark runs are visible to their effective owner or a caller granted
+  `scaled-evals.admin`. Non-private (`public`, `team`, `org`) rows are readable
+  by authenticated callers; team/org labels do not currently enforce membership.
+  Only owners/admins may cancel, delete, retry or request archives. `mine` and
+  `shared` narrow the authorized list and never widen it. Unknown, deleted and
+  inaccessible rows return the same 404, including logs, event streams,
+  downloads and benchmark member routes. Auth-disabled development retains
+  access to legacy ownerless rows.
+- **Deleting a benchmark run soft-deletes its member evaluations atomically.**
+  Artifacts remain under the existing retention behavior. Cancel active work
+  first and wait for runtime cleanup and pending artifact finalization; an
+  authorized delete returns 409 until those finish. The ownership check occurs
+  before reporting state conflicts. Projection payloads cannot bypass live SQL
+  eligibility or expose a soft-deleted member.
 - **The CLI takes a token, it does not obtain one.** `--token` /
   `SCALED_EVALS_TOKEN` is the only credential source; `scaled-evals auth
   login|status|logout` are gone and `auth whoami` is now top-level

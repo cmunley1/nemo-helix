@@ -9,12 +9,15 @@ import builtins
 from typing import Any
 
 import psycopg
+from psycopg.rows import dict_row
 from psycopg.types.json import Json
 
 from scaled_evals.api import config_profile_store
 from scaled_evals.api.benchmark_store import BenchmarkStore
 from scaled_evals.api.failure_diagnostics import failure_category_for_code, is_retryable_failure
+from scaled_evals.api.repositories.access import INTERNAL_ACCESS, ResourceAccess
 from scaled_evals.api.repositories.base_repository import (
+    Conflict,
     created_at_cursor_clause,
     join_where,
     normalize_order,
@@ -79,7 +82,7 @@ _MEMBERS_FOR_RUNS_SQL = """
         e.cancel_teardown_status, e.cancel_teardown_error,
         e.finished_at, e.task_id, e.task_revision
     FROM evaluations e
-    WHERE e.benchmark_run_id = ANY(%s) AND e.deleted_at IS NULL
+    WHERE e.benchmark_run_id = ANY(%s) AND e.deleted_at IS NULL AND {access}
     ORDER BY e.task_id, e.id
 """
 
@@ -303,8 +306,9 @@ class BenchmarkRunRepository:
     not stored — so there is no worker-side fan-in.
     """
 
-    def __init__(self, conn: psycopg.Connection) -> None:
+    def __init__(self, conn: psycopg.Connection, *, access: ResourceAccess = INTERNAL_ACCESS) -> None:
         self.conn = conn
+        self.access = access
 
     def load_experiment_identity(self, benchmark_run_id: str) -> dict | None:
         """Resolve a benchmark run to its intake Experiment identity.
@@ -486,16 +490,16 @@ class BenchmarkRunRepository:
     def get(self, run_id: str) -> dict | None:
         with self.conn.cursor() as cur:
             cur.execute(
-                f"SELECT {BENCHMARK_RUN_COLUMNS} FROM benchmark_runs WHERE id = %s AND deleted_at IS NULL",
-                (run_id,),
+                f"SELECT {BENCHMARK_RUN_COLUMNS} FROM benchmark_runs WHERE id = %s AND deleted_at IS NULL AND {self.access.run_read_clause()}",
+                (run_id, *self.access.run_parameters),
             )
             return cur.fetchone()
 
     def exists(self, run_id: str) -> bool:
         with self.conn.cursor() as cur:
             cur.execute(
-                "SELECT 1 FROM benchmark_runs WHERE id = %s AND deleted_at IS NULL",
-                (run_id,),
+                f"SELECT 1 FROM benchmark_runs WHERE id = %s AND deleted_at IS NULL AND {self.access.run_read_clause()}",
+                (run_id, *self.access.run_parameters),
             )
             return cur.fetchone() is not None
 
@@ -511,8 +515,8 @@ class BenchmarkRunRepository:
     ) -> builtins.list[dict]:
         direction = normalize_order(order)
         ordering = order_by_clause(("created_at", "id"), direction)
-        clauses = ["deleted_at IS NULL"]
-        params: list[Any] = []
+        clauses = ["deleted_at IS NULL", self.access.run_read_clause("br")]
+        params: list[Any] = list(self.access.run_parameters)
         if benchmark_id is not None:
             clauses.append("benchmark_id = %s")
             params.append(benchmark_id)
@@ -549,7 +553,9 @@ class BenchmarkRunRepository:
         if not run_ids:
             return []
         with self.conn.cursor() as cur:
-            cur.execute(_MEMBERS_FOR_RUNS_SQL, (run_ids,))
+            cur.execute(
+                _MEMBERS_FOR_RUNS_SQL.format(access=self.access.read_clause("e")), (run_ids, *self.access.parameters)
+            )
             rows = cur.fetchall()
         tasks = TaskStore().tasks(row["task_id"] for row in rows)
         return [
@@ -568,21 +574,36 @@ class BenchmarkRunRepository:
         """
         cancelled_members: list[dict] = []
         with self.conn.transaction(), self.conn.cursor() as cur:
+            if not self.access.include_all:
+                cur.execute(
+                    f"SELECT id FROM benchmark_runs WHERE id = %s AND deleted_at IS NULL "
+                    f"AND {self.access.write_clause()} FOR UPDATE",
+                    (run_id, *self.access.parameters),
+                )
+                if cur.fetchone() is None:
+                    return None, False, []
+                cur.execute(
+                    "SELECT id FROM evaluations WHERE benchmark_run_id = %s AND deleted_at IS NULL "
+                    f"AND NOT ({self.access.write_clause()}) ORDER BY id FOR UPDATE",
+                    (run_id, *self.access.parameters),
+                )
+                if cur.fetchone() is not None:
+                    return None, False, []
             cur.execute(
                 f"""
                 UPDATE benchmark_runs
                 SET cancelled_at = NOW(), updated_at = NOW()
-                WHERE id = %s AND deleted_at IS NULL AND cancelled_at IS NULL
+                WHERE id = %s AND deleted_at IS NULL AND {self.access.write_clause()} AND cancelled_at IS NULL
                 RETURNING {BENCHMARK_RUN_COLUMNS}
                 """,
-                (run_id,),
+                (run_id, *self.access.parameters),
             )
             run = cur.fetchone()
             cancelled_now = run is not None
             if not cancelled_now:
                 cur.execute(
-                    f"SELECT {BENCHMARK_RUN_COLUMNS} FROM benchmark_runs WHERE id = %s AND deleted_at IS NULL",
-                    (run_id,),
+                    f"SELECT {BENCHMARK_RUN_COLUMNS} FROM benchmark_runs WHERE id = %s AND deleted_at IS NULL AND {self.access.write_clause()}",
+                    (run_id, *self.access.parameters),
                 )
                 run = cur.fetchone()
             else:
@@ -606,11 +627,11 @@ class BenchmarkRunRepository:
                         archive_status = 'building',
                         archive_requested_at = NOW(),
                         updated_at = NOW()
-                    WHERE benchmark_run_id = %s AND deleted_at IS NULL
+                    WHERE benchmark_run_id = %s AND deleted_at IS NULL AND {self.access.write_clause()}
                       AND status IN {_CANCELLABLE_SQL}
                     RETURNING {EVALUATION_COLUMNS}
                     """,
-                    (run_id,),
+                    (run_id, *self.access.parameters),
                 )
                 cancelled_members = cur.fetchall()
                 for member in cancelled_members:
@@ -623,10 +644,58 @@ class BenchmarkRunRepository:
         return run, cancelled_now, cancelled_members
 
     def soft_delete(self, run_id: str) -> bool:
-        with self.conn.cursor() as cur:
+        with self.conn.transaction(), self.conn.cursor(row_factory=dict_row) as cur:
             cur.execute(
-                "UPDATE benchmark_runs SET deleted_at = NOW(), updated_at = NOW() "
-                "WHERE id = %s AND deleted_at IS NULL RETURNING id",
+                f"SELECT id FROM benchmark_runs WHERE id = %s AND deleted_at IS NULL "
+                f"AND {self.access.write_clause()} FOR UPDATE",
+                (run_id, *self.access.parameters),
+            )
+            if cur.fetchone() is None:
+                return False
+            cur.execute(
+                "SELECT id, owner_id, status, cancel_teardown_status, evidence_status, archive_status "
+                "FROM evaluations WHERE benchmark_run_id = %s AND deleted_at IS NULL ORDER BY id FOR UPDATE",
                 (run_id,),
             )
-            return cur.fetchone() is not None
+            members = cur.fetchall()
+            if not self.access.include_all and any(member["owner_id"] != self.access.owner_id for member in members):
+                return False
+            if any(
+                member["status"] not in _TERMINAL_STATUSES
+                or member["cancel_teardown_status"] in {"pending", "failed"}
+                or member["evidence_status"] == "building"
+                or member["archive_status"] == "building"
+                for member in members
+            ):
+                raise Conflict("run_not_deletable", "cancel active work and finish cleanup before deleting")
+            cur.execute(
+                "SELECT 1 FROM evaluation_execution_cleanups c JOIN evaluations e ON e.id = c.evaluation_id "
+                "WHERE e.benchmark_run_id = %s AND c.status <> 'deleted' LIMIT 1",
+                (run_id,),
+            )
+            if cur.fetchone() is not None:
+                raise Conflict("run_cleanup_pending", "member execution cleanup must finish before deleting")
+            cur.execute(
+                "SELECT 1 FROM benchmark_switchyard_campaigns WHERE benchmark_run_id = %s "
+                "AND status <> 'deleted' LIMIT 1",
+                (run_id,),
+            )
+            if cur.fetchone() is not None:
+                raise Conflict("run_cleanup_pending", "benchmark runtime cleanup must finish before deleting")
+            cur.execute(
+                "SELECT 1 FROM benchmark_run_archives WHERE benchmark_run_id = %s "
+                "AND status IN ('queued', 'building') FOR UPDATE",
+                (run_id,),
+            )
+            if cur.fetchone() is not None:
+                raise Conflict("run_archive_pending", "benchmark archive generation must finish before deleting")
+            cur.execute(
+                "UPDATE evaluations SET deleted_at = NOW(), updated_at = NOW() "
+                "WHERE benchmark_run_id = %s AND deleted_at IS NULL",
+                (run_id,),
+            )
+            cur.execute(
+                "UPDATE benchmark_runs SET deleted_at = NOW(), updated_at = NOW() WHERE id = %s",
+                (run_id,),
+            )
+            return True

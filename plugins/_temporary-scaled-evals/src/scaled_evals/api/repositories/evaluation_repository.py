@@ -16,6 +16,7 @@ from scaled_evals.api import config_profile_store
 from scaled_evals.api.benchmark_store import BenchmarkStore
 from scaled_evals.api.failure_diagnostics import failure_category_for_code
 from scaled_evals.api.redaction import redact_secret_text
+from scaled_evals.api.repositories.access import INTERNAL_ACCESS, ResourceAccess
 from scaled_evals.api.repositories.base_repository import (
     InvalidReference,
     created_at_cursor_clause,
@@ -349,8 +350,9 @@ _EVIDENCE_CLAIM_SQL = """
 
 
 class EvaluationRepository:
-    def __init__(self, conn: psycopg.Connection) -> None:
+    def __init__(self, conn: psycopg.Connection, *, access: ResourceAccess = INTERNAL_ACCESS) -> None:
         self.conn = conn
+        self.access = access
 
     def task_in_active_use(self, task_id: str) -> bool:
         """Return whether an unfinished evaluation runs the task."""
@@ -706,8 +708,8 @@ class EvaluationRepository:
     ) -> builtins.list[dict]:
         direction = normalize_order(order)
         ordering = order_by_clause(("created_at", "id"), direction)
-        clauses = ["deleted_at IS NULL"]
-        params: list[Any] = []
+        clauses = ["deleted_at IS NULL", self.access.read_clause()]
+        params: list[Any] = list(self.access.parameters)
         if owner_id is not None:
             clauses.append("owner_id = %s")
             params.append(owner_id)
@@ -787,15 +789,15 @@ class EvaluationRepository:
             )
             return _with_task_images(cur.fetchall())
 
-    def get(self, evaluation_id: str) -> dict | None:
+    def get(self, evaluation_id: str, *, for_write: bool = False) -> dict | None:
         with self.conn.cursor() as cur:
             cur.execute(
                 f"""
                 SELECT {EVALUATION_DETAIL_COLUMNS}
                 FROM evaluations e
-                WHERE e.id = %s AND e.deleted_at IS NULL
+                WHERE e.id = %s AND e.deleted_at IS NULL AND {(self.access.write_clause("e") if for_write else self.access.read_clause("e"))}
                 """,
-                (evaluation_id,),
+                (evaluation_id, *self.access.parameters),
             )
             row = cur.fetchone()
         return _with_task_images([row])[0] if row is not None else None
@@ -803,22 +805,22 @@ class EvaluationRepository:
     def exists(self, evaluation_id: str) -> bool:
         with self.conn.cursor() as cur:
             cur.execute(
-                "SELECT id FROM evaluations WHERE id = %s AND deleted_at IS NULL",
-                (evaluation_id,),
+                f"SELECT id FROM evaluations WHERE id = %s AND deleted_at IS NULL AND {self.access.read_clause()}",
+                (evaluation_id, *self.access.parameters),
             )
             return cur.fetchone() is not None
 
     def load_observability_row(self, evaluation_id: str) -> dict | None:
         with self.conn.cursor() as cur:
             cur.execute(
-                """
+                f"""
                 SELECT
                     id, status, status_detail, backend_handle, result, runtime,
                     created_at, updated_at, finished_at
                 FROM evaluations
-                WHERE id = %s AND deleted_at IS NULL
+                WHERE id = %s AND deleted_at IS NULL AND {self.access.read_clause()}
                 """,
-                (evaluation_id,),
+                (evaluation_id, *self.access.parameters),
             )
             return cur.fetchone()
 
@@ -852,10 +854,10 @@ class EvaluationRepository:
             )
             return cast(builtins.list[dict[str, Any]], cur.fetchall())
 
-    def load_archive_row(self, evaluation_id: str) -> dict | None:
+    def load_archive_row(self, evaluation_id: str, *, for_write: bool = False) -> dict | None:
         with self.conn.cursor() as cur:
             cur.execute(
-                """
+                f"""
                 SELECT
                     id,
                     archive_status,
@@ -864,15 +866,20 @@ class EvaluationRepository:
                     archive_built_at,
                     archive_error
                 FROM evaluations
-                WHERE id = %s AND deleted_at IS NULL
+                WHERE id = %s AND deleted_at IS NULL AND {(self.access.write_clause() if for_write else self.access.read_clause())}
                 """,
-                (evaluation_id,),
+                (evaluation_id, *self.access.parameters),
             )
             return cur.fetchone()
 
     def retry_failed(self, evaluation_id: str) -> dict | None:
         """Queue the next execution of a failed logical evaluation."""
         with self.conn.transaction(), self.conn.cursor() as cur:
+            cur.execute(
+                "SELECT br.id FROM benchmark_runs br JOIN evaluations e ON e.benchmark_run_id = br.id "
+                "WHERE e.id = %s FOR UPDATE OF br",
+                (evaluation_id,),
+            )
             cur.execute(
                 f"""
                 UPDATE evaluations
@@ -918,7 +925,7 @@ class EvaluationRepository:
                     archive_claimed_by = NULL,
                     archive_build_attempts = 0,
                     updated_at = NOW()
-                WHERE id = %s
+                WHERE id = %s AND {self.access.write_clause()}
                   AND deleted_at IS NULL
                   AND status = 'failed'
                   AND evidence_claimed_by IS NULL
@@ -935,7 +942,7 @@ class EvaluationRepository:
                   )
                 RETURNING {EVALUATION_COLUMNS}
                 """,
-                (evaluation_id,),
+                (evaluation_id, *self.access.parameters),
             )
             row = cur.fetchone()
             if row is not None:
@@ -952,7 +959,7 @@ class EvaluationRepository:
         """Explain why a failed evaluation did not transition to a retry."""
         with self.conn.cursor() as cur:
             cur.execute(
-                """
+                f"""
                 SELECT CASE
                     WHEN evidence_claimed_by IS NOT NULL
                       OR archive_claimed_by IS NOT NULL
@@ -969,11 +976,11 @@ class EvaluationRepository:
                     ELSE NULL
                 END AS reason
                 FROM evaluations
-                WHERE id = %s
+                WHERE id = %s AND {self.access.write_clause()}
                   AND deleted_at IS NULL
                   AND status = 'failed'
                 """,
-                (evaluation_id,),
+                (evaluation_id, *self.access.parameters),
             )
             row = cur.fetchone()
         if row is None:
@@ -1002,10 +1009,10 @@ class EvaluationRepository:
                     archive_status = 'building',
                     archive_requested_at = NOW(),
                     updated_at = NOW()
-                WHERE id = %s AND deleted_at IS NULL AND status IN {_CANCELLABLE_SQL}
+                WHERE id = %s AND deleted_at IS NULL AND {self.access.write_clause()} AND status IN {_CANCELLABLE_SQL}
                 RETURNING {EVALUATION_COLUMNS}
                 """,
-                (evaluation_id,),
+                (evaluation_id, *self.access.parameters),
             )
             row = cur.fetchone()
             cancelled_now = row is not None
@@ -1013,8 +1020,8 @@ class EvaluationRepository:
                 self.insert_status_event(cur, evaluation_id, "cancelled", row.get("status_detail"))
             if row is None:
                 cur.execute(
-                    f"SELECT {EVALUATION_COLUMNS} FROM evaluations WHERE id = %s AND deleted_at IS NULL",
-                    (evaluation_id,),
+                    f"SELECT {EVALUATION_COLUMNS} FROM evaluations WHERE id = %s AND deleted_at IS NULL AND {self.access.write_clause()}",
+                    (evaluation_id, *self.access.parameters),
                 )
                 row = cur.fetchone()
         return row, cancelled_now
@@ -1070,20 +1077,20 @@ class EvaluationRepository:
     def soft_delete(self, evaluation_id: str) -> bool:
         with self.conn.transaction(), self.conn.cursor() as cur:
             cur.execute(
-                """
+                f"""
                 UPDATE evaluations
                 SET deleted_at = NOW(), updated_at = NOW()
-                WHERE id = %s AND deleted_at IS NULL
+                WHERE id = %s AND deleted_at IS NULL AND {self.access.write_clause()}
                 RETURNING id
                 """,
-                (evaluation_id,),
+                (evaluation_id, *self.access.parameters),
             )
             return cur.fetchone() is not None
 
     def request_archive_build(self, evaluation_id: str, *, force: bool) -> dict | None:
         with self.conn.cursor() as cur:
             cur.execute(
-                """
+                f"""
                 UPDATE evaluations
                 SET archive_status = 'building',
                     archive_requested_at = NOW(),
@@ -1094,7 +1101,7 @@ class EvaluationRepository:
                     archive_size_bytes = CASE WHEN %s THEN NULL ELSE archive_size_bytes END,
                     archive_built_at = CASE WHEN %s THEN NULL ELSE archive_built_at END,
                     updated_at = NOW()
-                WHERE id = %s AND deleted_at IS NULL
+                WHERE id = %s AND deleted_at IS NULL AND {self.access.write_clause()}
                 RETURNING
                     id,
                     archive_status,
@@ -1103,7 +1110,7 @@ class EvaluationRepository:
                     archive_built_at,
                     archive_error
                 """,
-                (force, force, force, evaluation_id),
+                (force, force, force, evaluation_id, *self.access.parameters),
             )
             return cur.fetchone()
 
@@ -1115,8 +1122,12 @@ class EvaluationRepository:
         cursor: str | None,
         offset: int,
     ) -> builtins.list[dict]:
-        filters = ["evaluation_id = %s"]
-        params: list[Any] = [evaluation_id]
+        filters = [
+            "evaluation_id = %s",
+            "EXISTS (SELECT 1 FROM evaluations e WHERE e.id = evaluation_id "
+            f"AND e.deleted_at IS NULL AND {self.access.read_clause('e')})",
+        ]
+        params: list[Any] = [evaluation_id, *self.access.parameters]
         cursor_filter, cursor_params = self.event_cursor_clause(cursor)
         if cursor_filter:
             filters.append(cursor_filter)
@@ -1143,8 +1154,12 @@ class EvaluationRepository:
         after_id: int | None = None,
         limit: int,
     ) -> builtins.list[dict]:
-        filters = ["evaluation_id = %s"]
-        params: list[Any] = [evaluation_id]
+        filters = [
+            "evaluation_id = %s",
+            "EXISTS (SELECT 1 FROM evaluations e WHERE e.id = evaluation_id "
+            f"AND e.deleted_at IS NULL AND {self.access.read_clause('e')})",
+        ]
+        params: list[Any] = [evaluation_id, *self.access.parameters]
         if after_created_at is not None and after_id is not None:
             filters.append("(created_at, id) > (%s, %s)")
             params.extend([after_created_at, after_id])
@@ -1165,12 +1180,12 @@ class EvaluationRepository:
     def load_stream_status(self, evaluation_id: str) -> str | None:
         with self.conn.cursor() as cur:
             cur.execute(
-                """
+                f"""
                 SELECT status
                 FROM evaluations
-                WHERE id = %s AND deleted_at IS NULL
+                WHERE id = %s AND deleted_at IS NULL AND {self.access.read_clause()}
                 """,
-                (evaluation_id,),
+                (evaluation_id, *self.access.parameters),
             )
             row = cur.fetchone()
         return None if row is None else str(row["status"])

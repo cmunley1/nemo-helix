@@ -1168,12 +1168,12 @@ def test_retry_queues_next_execution_on_same_benchmark_member() -> None:
     assert body["current_execution"] == 2
     assert body["links"]["retry"] == "/evaluations/ev_test123/retry"
     cur = conn.cursor.return_value.__enter__.return_value
-    retry_sql = cur.execute.call_args_list[1].args[0]
+    retry_sql = cur.execute.call_args_list[2].args[0]
     assert "UPDATE evaluations" in retry_sql
     assert "status = 'failed'" in retry_sql
     assert "current_execution = current_execution + 1" in retry_sql
     assert "INSERT INTO evaluations" not in retry_sql
-    event_call = cur.execute.call_args_list[2]
+    event_call = cur.execute.call_args_list[3]
     assert event_call.args[1][1:3] == ("retry", "queued")
     conn.commit.assert_called_once()
 

@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Generator, Iterator
 from contextlib import AbstractContextManager, contextmanager
 from threading import Lock
 from typing import Annotated
@@ -12,6 +12,7 @@ from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool, PoolTimeout
 
 from scaled_evals.api.agent_bundle_store import AgentBundleStore
+from scaled_evals.api.auth import CurrentPrincipal, current_principal
 from scaled_evals.api.benchmark_import_store import BenchmarkImportStore
 from scaled_evals.api.benchmark_store import BenchmarkStore
 from scaled_evals.api.config_profile_store import ConfigProfileStore
@@ -24,9 +25,11 @@ from scaled_evals.api.repositories import (
     ResourceUsageRepository,
     UserRepository,
 )
+from scaled_evals.api.repositories.access import ResourceAccess
 from scaled_evals.api.repositories.benchmark_archive_repository import BenchmarkArchiveRepository
 from scaled_evals.api.settings import settings
 from scaled_evals.api.task_store import TaskStore
+from scaled_evals.api.tenancy import IsAdmin
 
 _pool: ConnectionPool | None = None
 _pool_lock = Lock()
@@ -164,3 +167,44 @@ def stream_database() -> Iterator[Database]:
 def get_stream_database_factory() -> Callable[[], AbstractContextManager[Database]]:
     """Return a factory without checking out a connection for the request lifetime."""
     return stream_database
+
+
+class RequestDatabase(Database):
+    def __init__(self, database: Database, access: ResourceAccess) -> None:
+        super().__init__(database.conn)
+        self.access = access
+
+    @property
+    def evaluations(self) -> EvaluationRepository:
+        return EvaluationRepository(self.conn, access=self.access)
+
+    @property
+    def benchmark_runs(self) -> BenchmarkRunRepository:
+        return BenchmarkRunRepository(self.conn, access=self.access)
+
+    @property
+    def benchmark_archives(self) -> BenchmarkArchiveRepository:
+        return BenchmarkArchiveRepository(self.conn, access=self.access)
+
+
+def get_request_db(
+    database: Annotated[Database, Depends(get_db)],
+    current: Annotated[CurrentPrincipal, Depends(current_principal)],
+    admin: IsAdmin,
+) -> RequestDatabase:
+    return RequestDatabase(database, ResourceAccess(current.owner_id, admin or current.source == "disabled"))
+
+
+def get_request_stream_database_factory(
+    factory: Annotated[Callable[[], AbstractContextManager[Database]], Depends(get_stream_database_factory)],
+    current: Annotated[CurrentPrincipal, Depends(current_principal)],
+    admin: IsAdmin,
+) -> Callable[[], AbstractContextManager[Database]]:
+    access = ResourceAccess(current.owner_id, admin or current.source == "disabled")
+
+    @contextmanager
+    def request_database() -> Generator[Database, None, None]:
+        with factory() as database:
+            yield RequestDatabase(database, access)
+
+    return request_database

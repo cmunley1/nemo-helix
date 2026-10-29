@@ -335,7 +335,10 @@ def test_evaluation_manual_retry_preserves_identity_and_resets_terminal_state() 
     row = EvaluationRepository(conn).retry_failed("ev_safe")
 
     assert row is not None
-    retry_sql, retry_params = _executed_sql_and_params(cur)
+    lock_sql, lock_params = _executed_sql_and_params(cur)
+    assert "FOR UPDATE OF br" in lock_sql
+    assert lock_params == ("ev_safe",)
+    retry_sql, retry_params = _executed_sql_and_params(cur, 1)
     assert "status = 'queued'" in retry_sql
     assert "status = 'failed'" in retry_sql
     assert "current_execution = current_execution + 1" in retry_sql
@@ -345,7 +348,7 @@ def test_evaluation_manual_retry_preserves_identity_and_resets_terminal_state() 
     assert "evidence_status = 'missing'" in retry_sql
     assert "archive_status = 'missing'" in retry_sql
     assert retry_params == ("ev_safe",)
-    event_sql, event_params = _executed_sql_and_params(cur, 1)
+    event_sql, event_params = _executed_sql_and_params(cur, 2)
     assert "INSERT INTO evaluation_events" in event_sql
     assert event_params == (
         "ev_safe",

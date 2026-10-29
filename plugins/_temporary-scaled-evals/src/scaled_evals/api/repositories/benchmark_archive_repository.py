@@ -7,6 +7,7 @@ from uuid import uuid4
 import psycopg
 from psycopg.types.json import Jsonb
 
+from scaled_evals.api.repositories.access import INTERNAL_ACCESS, ResourceAccess
 from scaled_evals.api.repositories.base_repository import Conflict, NotFound
 from scaled_evals.models.benchmark_archives import BenchmarkArchiveMember
 
@@ -21,29 +22,38 @@ _CLAIMABLE = """
 
 
 class BenchmarkArchiveRepository:
-    def __init__(self, conn: psycopg.Connection[Any]) -> None:
+    def __init__(self, conn: psycopg.Connection[Any], *, access: ResourceAccess = INTERNAL_ACCESS) -> None:
         self.conn = conn
+        self.access = access
 
     def get(self, run_id: str) -> dict | None:
         with self.conn.cursor() as cur:
             cur.execute(
                 "SELECT a.* FROM benchmark_run_archives a JOIN benchmark_runs b "
-                "ON b.id = a.benchmark_run_id WHERE b.id = %s AND b.deleted_at IS NULL",
-                (run_id,),
+                f"ON b.id = a.benchmark_run_id WHERE b.id = %s AND b.deleted_at IS NULL AND {self.access.run_read_clause('b')}",
+                (run_id, *self.access.run_parameters),
             )
             return cur.fetchone()
 
     def request(self, run_id: str, *, force: bool = False) -> dict:
         with self.conn.transaction(), self.conn.cursor() as cur:
             cur.execute(
-                "SELECT framework FROM benchmark_runs WHERE id = %s AND deleted_at IS NULL FOR UPDATE",
-                (run_id,),
+                f"SELECT framework FROM benchmark_runs WHERE id = %s AND deleted_at IS NULL AND {self.access.write_clause()} FOR UPDATE",
+                (run_id, *self.access.parameters),
             )
             run = cur.fetchone()
             if run is None:
                 raise NotFound("benchmark_run", "benchmark run not found")
             if run["framework"] != "harbor":
                 raise Conflict("unsupported_framework", "benchmark archives require Harbor")
+            if not self.access.include_all:
+                cur.execute(
+                    "SELECT id FROM evaluations WHERE benchmark_run_id = %s AND deleted_at IS NULL "
+                    f"AND NOT ({self.access.write_clause()}) ORDER BY id FOR SHARE",
+                    (run_id, *self.access.parameters),
+                )
+                if cur.fetchone() is not None:
+                    raise NotFound("benchmark_run", "benchmark run not found")
             existing = self.get(run_id)
             if existing and (
                 existing["status"] in {"queued", "building"} or (existing["status"] == "ready" and not force)

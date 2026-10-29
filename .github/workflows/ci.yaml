@@ -1202,6 +1202,18 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432/tcp
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - name: Checkout code
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
@@ -1218,6 +1230,7 @@ jobs:
         run: uv run --frozen --group scaled-evals pytest plugins/_temporary-scaled-evals/tests -v
         env:
           _TYPER_FORCE_DISABLE_TERMINAL: "1"
+          SCALED_EVALS_TEST_DATABASE_URL: postgresql://postgres@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/postgres
       # The workspace venv carries a single Harbor release, but NemoOpenSandboxEnvironment must run on
       # every runner harbor_opensandbox accepts: those whose requirements pin the OpenSandbox SDK.
       # Build each runner's venv from its own requirements, as the image does, and run the tests there.
