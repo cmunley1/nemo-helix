@@ -9,7 +9,7 @@
 
 ## What you need
 
-- The `nemo` CLI in the notebook kernel's environment: `pip install nemo-helix` (or this repository's `.venv`).
+- A notebook kernel whose environment has the `nemo` CLI with the evals plugin: `pip install 'nemo-helix[nemo-evals-plugin]'`, or this repository's `.venv`. The first code cell installs pandas and matplotlib into it if they're missing.
 - A CLI context for the deployment: `nemo config set --context <name> --base-url <url>`. Set `CONTEXT` in the notebook's first code cell.
 - A model the deployment's Inference Gateway serves (`MODEL`). The notebook puts a closed-book virtual model in front of it: DeepSWE tasks have no network, so the platform accepts a model-calling agent only through one.
 - A sandbox profile, set by the platform admin in the Helm values (`evals.runs.harbor.sandbox_profiles`), whose `agent_setup_egress` lists the hosts codex installs from (Debian, Node.js, npm, GitHub). The admin can change a profile or add one; pick it with `SANDBOX_PROFILE`.
@@ -19,7 +19,7 @@
 
 | Section | Commands |
 | --- | --- |
-| 1. Connect and prepare | `experiments create`, `inference virtual-models create` (only if missing) |
+| 1. Connect and prepare | `pip install pandas matplotlib`, `experiments create`, `inference virtual-models create` (each only if missing) |
 | 2. Meet the tasks | Harbor Hub `task.toml` metadata: title, language, category |
 | 3. Submit, `MODE = "taskset"` | `evals tasksets create` → `evals tasksets build-images --wait` → `evals runs submit --taskset` |
 | 3. Submit, `MODE = "submit"` | `evals runs submit --harbor-hub` (publishes, builds and submits) |
@@ -29,16 +29,16 @@
 | 7. Next | Studio leaderboard links; compare runs (`COMPARE`) |
 
 - Every command is printed before it runs.
-- Re-running with the same parameters returns the same run (the idempotency key derives from them). Change `RUN_LABEL` for a new one.
+- Re-running cells in the same kernel returns the run already started instead of starting another; a new kernel starts a new run.
 - `RUN_ID` skips submitting and analyzes an existing run.
 
 ## Time
 
 All 10 tasks run at once, so the slowest task sets the pace.
 
-- `codex`: about 1 hour. Most tasks took 7–17 min of agent time; `dynamodb-toolbox-lazy-recursive-schemas` took 54–56 min in our runs. Drop it from `TASKS` for a faster demo.
+- `codex`: up to about 40 min. Most tasks took 6–14 min of agent time; `fastapi-implicit-head-options` (16–34 min) and `expr-try-catch-errors` (19–21 min) were the slowest in our runs.
 - `oracle` (each task's reference solution, no model): about 2 min. Use it to check the deployment, or as a ceiling next to an agent's run.
-- Codex installs itself in each sandbox during setup; a failed install (network) ends that trial before the agent runs. The notebook reports those separately from tasks the agent didn't solve.
+- Codex installs itself in each sandbox during setup. A trial that ends in an error, such as a failed install, reruns once in a new sandbox (`max_retries: 1`); a second failure ends it before the agent runs. The notebook reports those separately from tasks the agent didn't solve.
 
 ## Run it headless
 
