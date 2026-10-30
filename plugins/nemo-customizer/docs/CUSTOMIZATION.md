@@ -45,7 +45,7 @@ Use `add_job_routes(YourJob, service_name="customization", ...)` so Jobs records
 ## Skills
 
 The plugin ships two skills under `src/nemo_customizer/skills/`: `nemo-customizer` (submit and
-monitor training jobs) and `nemo-gym-environments` (build GRPO reward environments). They are
+monitor training jobs) and `nemo-gym-environments` (build GRPO RL environments). They are
 installed into coding agents without the repository, so every path they reference must resolve
 inside the installed skill. Repository paths belong here, not in the skills.
 

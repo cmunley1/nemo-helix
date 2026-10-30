@@ -102,7 +102,7 @@ export const estimateTrainingRows = (files: AnnotatedFilesetFile[], validUtf8 = 
     { trainingRowCount: 0, rowCountIsEstimate: !validUtf8 }
   );
 
-/** The picked reward environment, with what its `nemo-environment.yaml` says about itself. */
+/** The picked RL environment, with what its `nemo-environment.yaml` says about itself. */
 export interface DraftEnvironment {
   /** The picked fileset, as `workspace/name`. */
   fileset: string;
@@ -312,7 +312,7 @@ export type DraftValidation =
   | { status: 'invalid'; errors: string[] };
 
 /**
- * The teacher, and a reward environment the user did not pick here, are picked in the form;
+ * The teacher, and an RL environment the user did not pick here, are picked in the form;
  * the draft says so in `needs_from_user`, and the form flags them at submit.
  */
 const DEFERRABLE_FIELDS = new Set(['grpo.environmentFileset', 'automodel.training.teacher_model']);

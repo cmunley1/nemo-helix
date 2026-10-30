@@ -72,15 +72,15 @@ describe('messages', () => {
     expect(user.content).toContain('- Training examples: about 52000 (estimated from file sizes)');
   });
 
-  it('says when no reward environment was picked', () => {
+  it('says when no RL environment was picked', () => {
     const [, user] = buildDraftMessages('route tickets', INPUTS);
-    expect(user.content).toContain('## Reward environment (grpo only)\nNot picked.');
+    expect(user.content).toContain('## RL environment (grpo only)\nNot picked.');
   });
 
   it('describes a picked environment from its manifest', () => {
     const [, user] = buildDraftMessages('write sql', { ...INPUTS, environment: SQL_ENVIRONMENT });
     expect(user.content).toContain(
-      '## Reward environment (grpo only)\ndefault/sql-env — text2sql: Executes generated SQL and rewards matching result sets.\n- Format: adapter-wheels-v1\n- Agent: verifiers_agent'
+      '## RL environment (grpo only)\ndefault/sql-env — text2sql: Executes generated SQL and rewards matching result sets.\n- Format: adapter-wheels-v1\n- Agent: verifiers_agent'
     );
   });
 

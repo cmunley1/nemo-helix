@@ -2,11 +2,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-title: "GRPO and Reward Environments"
-description: "Train a model with GRPO against a NeMo Gym reward environment."
+title: "GRPO and RL Environments"
+description: "Train a model with GRPO against a NeMo Gym RL environment."
 ---
 
-GRPO (Group Relative Policy Optimization) trains a model against a **reward environment** instead of labeled completions. For each prompt the platform samples a group of responses, the environment scores them, and the policy is updated toward the responses that scored better than the others in their group.
+GRPO (Group Relative Policy Optimization) trains a model against an **RL environment** instead of labeled completions. For each prompt the platform samples a group of responses, the environment scores them, and the policy is updated toward the responses that scored better than the others in their group.
 
 That last part is why GRPO behaves differently from every other customization method here: the learning signal is the _spread_ of rewards inside a group. If every response to a prompt earns the same score, that prompt contributes nothing.
 
@@ -52,7 +52,7 @@ config_paths: # at least one, relative to the package root
   - configs/my_env.yaml
 metadata:
   name: my-env # required
-  description: Custom reward environment
+  description: Custom RL environment
 ```
 
 `adapter-wheels-v1` adds one additional block, because the agent harness comes from the training image rather than the package:

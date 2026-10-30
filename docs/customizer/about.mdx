@@ -227,13 +227,13 @@ The main control is `ref_policy_kl_penalty` (β), which sets how far the policy 
 
 ### Group Relative Policy Optimization
 
-GRPO needs no labeled responses at all. For each prompt it samples a **group** of responses, hands them to a **reward environment** that scores each one, and updates the policy toward the responses that scored better than the others in their group.
+GRPO needs no labeled responses at all. For each prompt it samples a **group** of responses, hands them to an **RL environment** that scores each one, and updates the policy toward the responses that scored better than the others in their group.
 
 That framing has a consequence worth understanding before you start: the learning signal is the *spread* of rewards inside a group. A prompt whose responses all earn the same score contributes nothing to the update. This is why GRPO runs are read on reward rather than loss, and why sampling settings such as `temperature` and `num_generations_per_prompt` matter more here than in any other method.
 
 Use GRPO when correctness is *verifiable* — math with a checkable answer, code that either passes tests or does not, structured output that either parses or does not — rather than merely preferred.
 
-GRPO requires a [NeMo Gym](https://docs.nvidia.com/nemo/gym/about/) environment packaged as a FileSet, alongside the prompt dataset. See [GRPO and Reward Environments](/documentation/customizer-reference/grpo-and-reward-environments).
+GRPO requires a [NeMo Gym](https://docs.nvidia.com/nemo/gym/about/) environment packaged as a FileSet, alongside the prompt dataset. See [GRPO and RL Environments](/documentation/customizer-reference/grpo-and-reward-environments).
 
 <Note>
 

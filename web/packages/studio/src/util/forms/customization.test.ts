@@ -48,7 +48,7 @@ const validUnsloth = (): CustomizationFormFields => {
   return data;
 };
 
-/** A fully-valid GRPO form value (model + dataset + reward environment filled). */
+/** A fully-valid GRPO form value (model + dataset + RL environment filled). */
 const validGrpo = (): CustomizationFormFields => {
   const data = structuredClone(FORM_DEFAULTS);
   data.backend = 'rl';
@@ -398,10 +398,10 @@ describe('GRPO form validation', () => {
     expect(messages(validGrpo())).toEqual([]);
   });
 
-  it('requires a reward environment fileset', () => {
+  it('requires an RL environment fileset', () => {
     const data = validGrpo();
     data.grpo.environmentFileset = '';
-    expect(messages(data)).toContain('A reward environment fileset is required for GRPO training');
+    expect(messages(data)).toContain('An RL environment fileset is required for GRPO training');
   });
 
   it('rejects max new tokens above the max sequence length', () => {

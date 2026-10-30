@@ -221,7 +221,7 @@ Full-weight GRPO instead registers a new **model** entity, which does need its o
 | Situation | Pick |
 |---|---|
 | Limited GPU memory, or the full-weight run OOMs after `activation_checkpointing` | **LoRA** — the optimizer state is the adapter, not the model |
-| Several reward environments over one base model | **LoRA** — adapters share the base deployment |
+| Several RL environments over one base model | **LoRA** — adapters share the base deployment |
 | Reward barely moves and the task needs broad behaviour change | **Full weights** — the adapter may be the bottleneck; raise `rank` first, then reconsider |
 | You need merged weights to export or serve elsewhere | **Full weights** — GRPO does not merge adapters |
 

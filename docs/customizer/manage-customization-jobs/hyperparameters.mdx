@@ -281,7 +281,7 @@ The `rl` backend runs two methods on a Ray cluster, selected by `training.type`.
 | `training.type` | Trains on | Dataset |
 |-----------------|-----------|---------|
 | `"dpo"` | Preference pairs | One fileset holding `training.jsonl` and `validation.jsonl` |
-| `"grpo"` | A reward environment | One dataset fileset of rollout rows, **plus** an environment fileset |
+| `"grpo"` | An RL environment | One dataset fileset of rollout rows, **plus** an environment fileset |
 
 <Note>
 
@@ -378,7 +378,7 @@ Leaving both `target_modules` and `exclude_modules` unset adapts every linear la
 
 <Tip>
 
-GRPO progress is read on **reward**, not loss — the surrogate loss oscillates near zero and says nothing about run quality. See [GRPO and Reward Environments](/documentation/customizer-reference/grpo-and-reward-environments) for environment packaging, dataset format, and the metrics to monitor.
+GRPO progress is read on **reward**, not loss — the surrogate loss oscillates near zero and says nothing about run quality. See [GRPO and RL Environments](/documentation/customizer-reference/grpo-and-reward-environments) for environment packaging, dataset format, and the metrics to monitor.
 
 </Tip>
 

@@ -103,7 +103,7 @@ export const RewardEnvironmentSection: FC = () => {
 
   return (
     <FormSection
-      title="Reward Environment"
+      title="RL Environment"
       description={
         <>
           GRPO scores sampled responses using a NeMo Gym environment. Upload one to a fileset first,
@@ -132,7 +132,7 @@ export const RewardEnvironmentSection: FC = () => {
           >
             <SelectTrigger
               aria-label="environment-fileset-select"
-              placeholder={isPending ? 'Loading…' : 'Select a reward environment fileset'}
+              placeholder={isPending ? 'Loading…' : 'Select an RL environment fileset'}
             />
             <SelectContent>
               <SelectListbox>

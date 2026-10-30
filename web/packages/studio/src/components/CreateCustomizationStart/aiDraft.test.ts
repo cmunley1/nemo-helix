@@ -68,7 +68,7 @@ describe('validateDraft', () => {
       expect(summary.method).toBe('distillation');
     });
 
-    it('fills in the picked reward environment for GRPO', () => {
+    it('fills in the picked RL environment for GRPO', () => {
       const draft: CustomizationDraft = {
         backend: 'rl',
         job: {

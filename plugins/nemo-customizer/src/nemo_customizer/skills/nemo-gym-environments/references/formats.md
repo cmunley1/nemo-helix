@@ -215,7 +215,7 @@ config_paths:
   - configs/my_env.yaml
 metadata:
   name: my-env
-  description: Custom reward environment
+  description: Custom RL environment
 ```
 
 `wheels-v1` declares **no adapter**, so its code may be a verifier rather than an agent, and both `responses_api_agents` and `resources_servers` are started from it. Your config decides which servers exist.

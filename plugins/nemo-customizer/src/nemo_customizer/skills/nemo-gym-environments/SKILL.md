@@ -4,7 +4,7 @@
 
 name: nemo-gym-environments
 description: >-
-  Build, convert, validate and upload a NeMo Gym reward environment for GRPO
+  Build, convert, validate and upload a NeMo Gym RL environment for GRPO
   training: package your own reward code or a NeMo Gym server, convert a Prime
   Intellect or verifiers environment, and write the rollout-row dataset. Hand
   off to nemo-customizer to submit the GRPO job.
@@ -12,6 +12,7 @@ triggers:
   - nemo gym
   - nemo-gym
   - gym environment
+  - RL environment
   - reward environment
   - environment package
   - environment fileset

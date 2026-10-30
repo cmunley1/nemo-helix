@@ -38,7 +38,7 @@ The form has the following sections, shown as they apply to your selections:
 | Training Backend | **Automodel** (multi-GPU), **Unsloth** (single-GPU, 4-bit quantized), or **RL**. |
 | Model | Base model, output model name, and description. |
 | Training Method | For Automodel: fine-tuning type (**LoRA**, **LoRA (Merged)**, or **Full Weights**) and training type (**SFT** or **Distillation**, with a teacher model field for distillation). For Unsloth: fine-tuning type (**LoRA** or **Full Weights**). For RL: **DPO** or **GRPO**. |
-| Reward Environment | Shown for GRPO jobs. Selects the reward environment used during training. |
+| RL Environment | Shown for GRPO jobs. Selects the RL environment used during training. |
 | Training Data | The training **Dataset**, selected from filesets available in the workspace. Titled **Training Prompts** for GRPO jobs. |
 | Training Parameters | General hyperparameters such as epochs, learning rate, and batch size. Not shown for GRPO jobs, which use the GRPO sections below instead. |
 | LoRA Parameters | Shown when the training method uses a LoRA or LoRA-merged finetuning type. |

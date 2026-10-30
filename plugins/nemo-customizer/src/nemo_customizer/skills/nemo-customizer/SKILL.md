@@ -40,7 +40,7 @@ triggers:
   - unsloth --job-json
   - rl --job-json
 not-for:
-  - nemo-gym-environments (building, converting or validating a GRPO reward environment and its rollout rows)
+  - nemo-gym-environments (building, converting or validating a GRPO RL environment and its rollout rows)
   - nemo-build-agent (agent scaffold/deploy, not weight training)
   - nemo-setup (platform install; route here when CLI resolution fails)
   - safe-synthesizer (tabular synthetic data training)

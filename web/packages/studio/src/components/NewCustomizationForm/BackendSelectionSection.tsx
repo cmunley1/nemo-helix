@@ -24,7 +24,7 @@ const BACKENDS = [
     value: 'rl' as const,
     title: 'RL',
     description:
-      'Reinforcement learning via DPO on preference pairs or GRPO with a reward environment.',
+      'Reinforcement learning via DPO on preference pairs or GRPO with an RL environment.',
   },
 ];
 

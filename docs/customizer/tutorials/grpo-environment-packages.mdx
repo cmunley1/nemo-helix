@@ -8,7 +8,7 @@ description: "Package native-v1, wheels-v1, and adapter-wheels-v1 environment Fi
 
 <a id="grpo-environment-packages"></a>
 
-Package a GRPO reward environment as a FileSet. Job JSON, LoRA, metrics, and cluster flags are in [GRPO and Reward Environments](/documentation/customizer-reference/grpo-and-reward-environments).
+Package a GRPO RL environment as a FileSet. Job JSON, LoRA, metrics, and cluster flags are in [GRPO and RL Environments](/documentation/customizer-reference/grpo-and-reward-environments).
 
 A GRPO job takes **two** FileSets:
 
@@ -433,10 +433,10 @@ nemo files upload ./weather-env/ weather-env --workspace default
 nemo files list weather-env --workspace default
 ```
 
-Job JSON: [GRPO and Reward Environments](/documentation/customizer-reference/grpo-and-reward-environments#submit-the-job). Sandboxed Gym is configured on the platform (`NHX_RL_SANDBOXED_GYM_DEFAULT`), not in the job payload. Cluster setup: [OpenSandbox](/documentation/kubernetes-deployment/setup/helm/open-sandbox).
+Job JSON: [GRPO and RL Environments](/documentation/customizer-reference/grpo-and-reward-environments#submit-the-job). Sandboxed Gym is configured on the platform (`NHX_RL_SANDBOXED_GYM_DEFAULT`), not in the job payload. Cluster setup: [OpenSandbox](/documentation/kubernetes-deployment/setup/helm/open-sandbox).
 
 ## Next Steps
 
-- Submit the job and tune its hyperparameters in [GRPO and Reward Environments](/documentation/customizer-reference/grpo-and-reward-environments).
+- Submit the job and tune its hyperparameters in [GRPO and RL Environments](/documentation/customizer-reference/grpo-and-reward-environments).
 - Shape prompt rows for your environment's agent in [Format a Training Dataset](/documentation/customizer-reference/tutorials/format-training-dataset).
 - Monitor reward and the other training curves in [Check Customization Job Metrics](/documentation/customizer-reference/tutorials/metrics).

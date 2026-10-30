@@ -49,7 +49,7 @@ import { z } from 'zod';
 export interface GrpoFormFields extends RlGRPOTraining {
   /** 'grpo' shows the GRPO form sections; 'dpo' shows DPO sections. Maps to training.type on submit. */
   trainingType: RlDPOTraining['type'] | RlGRPOTraining['type'];
-  /** Fileset reference for the NeMo Gym reward environment. */
+  /** Fileset reference for the NeMo Gym RL environment. */
   environmentFileset: string;
 }
 
@@ -257,7 +257,7 @@ export const customizationFormSchema = z
         if (!grpo.environmentFileset) {
           ctx.addIssue({
             code: z.ZodIssueCode.custom,
-            message: 'A reward environment fileset is required for GRPO training',
+            message: 'An RL environment fileset is required for GRPO training',
             path: ['grpo', 'environmentFileset'],
           });
         }

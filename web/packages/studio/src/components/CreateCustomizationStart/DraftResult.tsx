@@ -139,7 +139,7 @@ export const DraftResult: FC<DraftResultProps> = ({ summary, config, onEdit }) =
             {summary.method === 'grpo' ? (
               <KVPair
                 orientation="vertical"
-                label="Reward environment"
+                label="RL environment"
                 value={summary.environment ?? PICK_IN_FORM}
                 attributes={WRAP_ANYWHERE}
               />

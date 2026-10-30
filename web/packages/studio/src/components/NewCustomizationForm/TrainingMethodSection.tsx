@@ -68,7 +68,7 @@ const RL_TRAINING_TYPES = [
   {
     value: 'grpo',
     title: 'GRPO',
-    description: 'Group Relative Policy Optimization — RL fine-tuning with a reward environment.',
+    description: 'Group Relative Policy Optimization — RL fine-tuning with an RL environment.',
   },
 ] as const;
 

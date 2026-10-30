@@ -174,7 +174,7 @@ export const DescribeWithAiPanel: FC<DescribeWithAiPanelProps> = ({ workspace, o
     : dataset.isPending
       ? 'Validating dataset files…'
       : isEnvironmentLoading
-        ? 'Reading the reward environment…'
+        ? 'Reading the RL environment…'
         : null;
 
   const failure = requestError ?? (validation?.status === 'invalid' ? validation.errors : null);
@@ -239,7 +239,7 @@ export const DescribeWithAiPanel: FC<DescribeWithAiPanelProps> = ({ workspace, o
                 purpose="environment"
                 useControllerProps={{ control: form.control, name: 'environment' }}
                 formFieldProps={{
-                  slotLabel: 'Reward environment',
+                  slotLabel: 'RL environment',
                   slotHelp:
                     'Detected a NeMo Gym dataset. Optionally pick the environment that scores its rollouts — or pick it later in the form.',
                 }}
