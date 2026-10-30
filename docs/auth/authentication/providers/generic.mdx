@@ -16,7 +16,7 @@ Verify your IdP meets these requirements:
 - [ ] Supports **OpenID Connect** (not just OAuth2)
 - [ ] Exposes a `.well-known/openid-configuration` discovery document
 - [ ] Supports the **device authorization grant** (required for `nemo auth login`)
-- [ ] Issues signed JWT bearer tokens, or signed ID tokens if you configure `bearer_token_source: "id_token"`
+- [ ] Issues signed JWT access tokens, or opaque access tokens with a supported server-side validation contract; ID tokens are not a supported API-bearer substitute
 - [ ] Includes **email** (or equivalent claim) in the selected bearer token
 - [ ] If you use group-based role bindings, includes group or entitlement values in a JWT claim that can be configured as `groups_claim`
 - [ ] If you use API-scope restrictions during OIDC login, can expose and return NeMo Helix API scopes such as `platform:read` and `platform:write`

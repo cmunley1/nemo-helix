@@ -89,9 +89,7 @@ auth:
     issuer: "https://your-idp.example.com/realm"
     public_client:
       client_id: "your-public-client-id"
-      # Optional: use the current OIDC ID token as the API bearer.
-      # Keep the default unless your IdP documents this backend pattern.
-      # bearer_token_source: "id_token"
+      # bearer_token_source: "access_token" (the only supported API bearer source)
       # authorization_endpoint: "https://your-idp.example.com/oauth2/authorize"
       # token_endpoint: "https://your-idp.example.com/oauth2/token"
       # device_authorization_endpoint: "https://your-idp.example.com/oauth2/device"
@@ -109,19 +107,22 @@ By default, NeMo Helix extracts group principals from the JWT `groups` claim. If
 
 ### Selecting the API bearer
 
-`bearer_token_source` controls which token from the current OIDC session is sent to NeMo Helix APIs:
+Studio, CLI and the login broker use `access_token` as the API bearer. The
+`bearer_token_source` field remains compatible with explicit `access_token`
+configuration, but `id_token` is no longer supported and fails configuration or
+discovery validation. An absent or expired access token does not fall back to
+an ID token. Ordinary OIDC login can still receive and validate ID tokens.
 
-- `access_token` (default) preserves the standard OAuth resource-server flow and existing provider behavior.
-- `id_token` supports providers that issue opaque access tokens but explicitly document their signed ID token as the browser application's backend credential.
+Studio reads the access token from the current `oidc-client-ts` user on every
+request, including after normal silent renewal. Deployments and stored CLI
+credentials that previously selected ID tokens need a new supported access-token
+login; this change does not automatically migrate them.
 
-The setting applies to clients that select that profile. Studio uses the public
-profile and reads the token from the current `oidc-client-ts` user on every
-request, including after silent renewal; it does not retain a separate copy of
-the initial ID token. The CLI fails authentication instead of falling back to
-the access token when the selected profile requires an ID token but none is
-present.
-
-Do not use `id_token` solely to work around an opaque access token. Confirm the provider contract, configure `audience`, and verify that the ID token contains the identity and group claims used by your RBAC policy. The `audience` setting defaults to unset; when it is unset, NeMo Helix validates the token signature, issuer, and expiry but does not require a specific audience.
+Removing the selection option does not make generic JWT validation distinguish
+access tokens from ID tokens. Client token selection is not server-side scope
+enforcement or a session-wide scope guarantee. Configure the API audience and
+use a verified provider access-token validation contract; an audience match
+alone does not establish token purpose.
 
 ### Step 3: Seed Auth Role Bindings
 
@@ -224,8 +225,8 @@ Regardless of IdP, ensure:
 4. Any group or entitlement values that should grant NeMo roles are present in the configured `groups_claim`.
 5. If an interactive profile's `default_scopes` includes NeMo Helix API scopes, those scopes are exposed by the IdP application and consented according to the provider's model.
 
-For providers that issue opaque access tokens but signed ID tokens, set `bearer_token_source: id_token` only when
-the NeMo Helix deployment is intentionally configured to validate that ID token's issuer, signature, and audience.
+For opaque access tokens, use the supported provider access-token resolution
+contract. Do not substitute an ID token to avoid access-token validation.
 
 When `device_authorization_requires_device_id` is enabled, the CLI stores a random installation identifier at
 `$XDG_STATE_HOME/nhx/oidc-device-id` (or `~/.local/state/nhx/oidc-device-id`) with mode `0600`. It reuses that value
