@@ -16,7 +16,7 @@ from nemo_helix_plugin.entities.base import EntityT, SyncEntityClient
 from nemo_helix_plugin.entities.client import EntitiesClient
 from nemo_helix_plugin.filter_ops import ComparisonOperation, FilterOperation, FilterOperator, LogicalOperation
 from nemo_helix_plugin.workspaces.client import WorkspacesClient
-from nemo_helix_plugin.workspaces.types import CreateWorkspaceRequest
+from nemo_helix_plugin.workspaces.types import CreateWorkspaceMemberRequest, CreateWorkspaceRequest
 
 from scaled_evals.api.repositories.base_repository import normalize_order
 from scaled_evals.api.schemas.common import decode_cursor
@@ -41,7 +41,7 @@ def entity_client() -> SyncEntityClient:
 
 @functools.cache
 def private_workspace() -> str:
-    """Return the workspace only this service can read, creating it on first use.
+    """Return this service's private storage workspace, creating it on first use.
 
     The plugin authorizes reads of what it keeps there itself, so no user may
     reach those entities directly through the Entities API.
@@ -59,6 +59,13 @@ def private_workspace() -> str:
         owner = client.get_workspace(name=name).data().created_by
         if owner != f"service:{SERVICE_NAME}":
             raise RuntimeError(f"workspace {name!r} belongs to {owner!r}, not the {SERVICE_NAME} service") from None
+    client.create_workspace_member(
+        workspace=name,
+        body=CreateWorkspaceMemberRequest(
+            principal=f"service:{SERVICE_NAME}",
+            roles=["Admin", "ServiceEntityStore"],
+        ),
+    ).data()
     return name
 
 

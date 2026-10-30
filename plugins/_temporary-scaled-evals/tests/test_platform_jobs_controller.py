@@ -465,6 +465,12 @@ def test_private_workspace_is_created_by_the_service_or_refused(monkeypatch: pyt
     entity_store.private_workspace.cache_clear()
     assert entity_store.private_workspace() == settings.entity_store_private_workspace
     assert workspaces.create_workspace.call_args.kwargs["body"].name == settings.entity_store_private_workspace
+    grant = workspaces.create_workspace_member.call_args.kwargs
+    assert grant["workspace"] == settings.entity_store_private_workspace
+    assert grant["body"].principal == "service:scaled-evals"
+    assert grant["body"].roles == ["Admin", "ServiceEntityStore"]
+    assert entity_store.private_workspace() == settings.entity_store_private_workspace
+    assert workspaces.create_workspace_member.call_count == 1
 
     # An existing workspace is reused only when this service created it.
     workspaces.create_workspace.side_effect = ConflictError(
@@ -474,7 +480,33 @@ def test_private_workspace_is_created_by_the_service_or_refused(monkeypatch: pyt
     entity_store.private_workspace.cache_clear()
     assert entity_store.private_workspace() == settings.entity_store_private_workspace
     workspaces.get_workspace.return_value.data.return_value.created_by = "mallory@example.com"
+    workspaces.create_workspace_member.reset_mock()
     entity_store.private_workspace.cache_clear()
     with pytest.raises(RuntimeError, match="mallory"):
         entity_store.private_workspace()
+    workspaces.create_workspace_member.assert_not_called()
     entity_store.private_workspace.cache_clear()
+
+
+def test_private_workspace_retries_failed_role_assignment(monkeypatch: pytest.MonkeyPatch) -> None:
+    import scaled_evals.api.entity_store as entity_store
+
+    monkeypatch.undo()
+    workspaces = MagicMock(spec=entity_store.WorkspacesClient)
+    workspaces.create_workspace.side_effect = [
+        MagicMock(),
+        ConflictError(httpx.Response(409, request=httpx.Request("POST", "http://entities"))),
+    ]
+    workspaces.get_workspace.return_value.data.return_value.created_by = "service:scaled-evals"
+    workspaces.create_workspace_member.side_effect = [RuntimeError("role grant failed"), MagicMock()]
+    monkeypatch.setattr(entity_store, "get_nemo_client", lambda **_: object())
+    monkeypatch.setattr(entity_store.WorkspacesClient, "from_client", lambda _client: workspaces)
+    entity_store.private_workspace.cache_clear()
+    try:
+        with pytest.raises(RuntimeError, match="role grant failed"):
+            entity_store.private_workspace()
+        assert entity_store.private_workspace() == settings.entity_store_private_workspace
+        assert workspaces.create_workspace.call_count == 2
+        assert workspaces.create_workspace_member.call_count == 2
+    finally:
+        entity_store.private_workspace.cache_clear()
